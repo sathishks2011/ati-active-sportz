@@ -12,6 +12,7 @@
 import Foundation
 import AVFoundation
 import React
+import UIKit
 
 @objc(Splicer)
 class Splicer: NSObject {
@@ -131,6 +132,21 @@ class Splicer: NSObject {
       return URL(fileURLWithPath: path)
     }()
     resolve(FileManager.default.fileExists(atPath: url.path))
+  }
+
+  /// Sets `UIApplication.shared.isIdleTimerDisabled` so the screen stays
+  /// awake while a Session is running (ADR-0002 — the Master encoder
+  /// dies when the OS locks the screen; foreground is non-negotiable).
+  /// Must be called from the main thread.
+  @objc func setIdleTimerDisabled(
+    _ disabled: NSNumber,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      UIApplication.shared.isIdleTimerDisabled = disabled.boolValue
+      resolve(nil)
+    }
   }
 
   /// Deletes the file at the given path or file:// URI. Used by the

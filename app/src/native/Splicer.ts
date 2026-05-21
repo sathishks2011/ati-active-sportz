@@ -33,6 +33,7 @@ type SplicerNative = {
   ) => Promise<SpliceResult>;
   fileExists: (path: string) => Promise<boolean>;
   deleteFile: (path: string) => Promise<boolean>;
+  setIdleTimerDisabled: (disabled: boolean) => Promise<void>;
 };
 
 const native = NativeModules.Splicer as SplicerNative | undefined;
@@ -72,4 +73,13 @@ export function fileExists(path: string): Promise<boolean> {
  */
 export function deleteFile(path: string): Promise<boolean> {
   return requireNative().deleteFile(path);
+}
+
+/**
+ * Sets `UIApplication.shared.isIdleTimerDisabled`. M6 keeps the screen
+ * awake for the duration of a Session (ADR-0002 — the OS killing the
+ * app to save power is the very thing we're trying to avoid).
+ */
+export function setIdleTimerDisabled(disabled: boolean): Promise<void> {
+  return requireNative().setIdleTimerDisabled(disabled);
 }

@@ -34,6 +34,8 @@ import {
   StyleSheet,
   Animated,
   ActivityIndicator,
+  AppState,
+  type AppStateStatus,
 } from 'react-native';
 import {
   Camera,
@@ -46,7 +48,11 @@ import {
   CameraRoll,
   iosRequestAddOnlyGalleryPermission,
 } from '@react-native-camera-roll/camera-roll';
-import { splice, type ActiveSegment } from '../native/Splicer';
+import {
+  setIdleTimerDisabled,
+  splice,
+  type ActiveSegment,
+} from '../native/Splicer';
 import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
 import {
   CALIBRATION_DURATION_MS,
@@ -302,6 +308,43 @@ export function RecordingScreen() {
       }
     }
   };
+
+  // Keep the screen awake for the entire RecordingScreen lifetime
+  // (ADR-0002 — if the OS locks the screen, the AVCaptureSession dies
+  // and the Master file is cut off; we must avoid getting interrupted
+  // by our own idle timer). The Setup and Done screens don't need
+  // this so we toggle it on the screen we actually want awake.
+  useEffect(() => {
+    setIdleTimerDisabled(true).catch(e =>
+      console.warn('[RecordingScreen] setIdleTimerDisabled true failed', e?.message ?? e),
+    );
+    return () => {
+      setIdleTimerDisabled(false).catch(e =>
+        console.warn('[RecordingScreen] setIdleTimerDisabled false failed', e?.message ?? e),
+      );
+    };
+  }, []);
+
+  // Backgrounding kills the AVCaptureSession on iOS (ADR-0002), so we
+  // trigger the same Stop path the user would tap. If the splice
+  // completes before the OS suspends us, the Session lands in Photos
+  // normally; otherwise the M5 recovery sweep finishes the job on
+  // next launch. Either way the user doesn't lose footage.
+  //
+  // The listener is captured in a ref to avoid stale closures — onStop
+  // closes over a bunch of store actions that the React Native
+  // AppState listener wouldn't see updates to otherwise.
+  const onStopRef = useRef(onStop);
+  onStopRef.current = onStop;
+  useEffect(() => {
+    const handle = (status: AppStateStatus) => {
+      if (status !== 'background') return;
+      console.log('[RecordingScreen] AppState → background, stopping Session');
+      onStopRef.current();
+    };
+    const sub = AppState.addEventListener('change', handle);
+    return () => sub.remove();
+  }, []);
 
   return (
     <View style={styles.root}>
