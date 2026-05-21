@@ -7,17 +7,23 @@
  *   - Court ROI rectangle; translucent warm fill only while `Capturing`.
  *   - Bottom-right FAB Stop, action color carries the state.
  *
- * Lifecycle: this screen is the one place where `Camera + useVideoOutput`
- * is bound. It mounts when `sessionMachine` is in any running state
- * (Calibrating | Watching | Capturing | Stopping). On mount it starts the
- * Master Recording; on Stop it transitions to Stopping, stops the
- * recorder, splices with M1's hardcoded segments, saves to Photos, and
- * transitions to Done.
+ * Lifecycle: this screen is the one place where `Camera +
+ * useVideoOutput + useFrameOutput` are bound. It mounts when
+ * `sessionMachine` is in any running state (Calibrating | Watching |
+ * Capturing | Stopping). On mount it starts the Master Recording and the
+ * motion Frame Processor. On Stop it transitions to Stopping, stops the
+ * recorder, splices the Master using the segments the Segmenter emitted
+ * during the run, saves to Photos, and transitions to Done.
  *
- * Detection (M3) is not wired — `motionScore` stays at 0 so the bars
- * render at their floor. State stays in Watching after Calibrating ends;
- * Capturing visuals are designed and reachable but not driven by anything
- * until motion detection lands.
+ * M3 detection wiring:
+ *   - The Frame Processor runs Y-plane diffing inside the ROI and emits
+ *     a motion score (0..1) every Nth frame via `runOnJS`.
+ *   - That score feeds both the motion-bar UI (`setMotionScore`) and the
+ *     Segmenter (`src/detection/segmenter.ts`), which holds the
+ *     open/close hysteresis and produces ActiveSegmentRecords.
+ *   - The Segmenter is gated off during `Calibrating` so no Active
+ *     Segments are emitted from the Warm-up window (CONTEXT.md).
+ *   - On Stop we `forceClose` any in-flight Segment before splicing.
  */
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -45,6 +51,8 @@ import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
 import {
   CALIBRATION_DURATION_MS,
   useSessionStore,
+  type ActiveSegmentRecord,
+  type DoneInfo,
   type SessionState,
 } from '../state/sessionMachine';
 import {
@@ -56,15 +64,8 @@ import {
   spacing,
   typography,
 } from '../design/tokens';
-
-// Hardcoded for M2 (carried over from M1): 5–15s and 25–40s of the Master
-// become the Session. Real motion-derived segments arrive in M3. The user
-// must keep the Session running long enough to include both windows or the
-// later segment is clamped by AVFoundation.
-const HARDCODED_SEGMENTS: ActiveSegment[] = [
-  { startSeconds: 5, endSeconds: 15 },
-  { startSeconds: 25, endSeconds: 40 },
-];
+import { useMotionFrameOutput } from '../detection/motionFrameProcessor';
+import { Segmenter } from '../detection/segmenter';
 
 const BAR_COUNT = 5;
 const BAR_MAX = 22;
@@ -91,7 +92,11 @@ export function RecordingScreen() {
   const recordingStartedAt = useSessionStore(s => s.recordingStartedAt);
   const roi = useSessionStore(s => s.roi);
   const motionScore = useSessionStore(s => s.motionScore);
+  const setMotionScore = useSessionStore(s => s.setMotionScore);
   const endCalibration = useSessionStore(s => s.endCalibration);
+  const markRecorderStarted = useSessionStore(s => s.markRecorderStarted);
+  const openActiveSegment = useSessionStore(s => s.openActiveSegment);
+  const closeActiveSegment = useSessionStore(s => s.closeActiveSegment);
   const beginStopping = useSessionStore(s => s.beginStopping);
   const finishWithSuccess = useSessionStore(s => s.finishWithSuccess);
   const finishWithError = useSessionStore(s => s.finishWithError);
@@ -111,6 +116,37 @@ export function RecordingScreen() {
   // which fires when the first preview frame arrives — by then the output
   // is wired up.
   const [previewStarted, setPreviewStarted] = useState(false);
+  // Wall-clock at the moment the recorder.startRecording promise resolved
+  // — i.e., the camera is actually writing frames to the Master. Used as
+  // the time origin for ActiveSegmentRecord seconds-into-Master. Held in
+  // a ref because it's read inside the Frame Processor's runOnJS callback
+  // and we don't want re-renders to swap the closure.
+  const recorderStartedAtRef = useRef<number | null>(null);
+
+  // The Segmenter outlives individual renders (it holds open-Segment
+  // state). Construct it once with stable callbacks that read the latest
+  // store actions / ref via closure.
+  const segmenterRef = useRef<Segmenter | null>(null);
+  if (segmenterRef.current == null) {
+    segmenterRef.current = new Segmenter({
+      onOpen: () => openActiveSegment(),
+      onClose: (segment: ActiveSegmentRecord) => closeActiveSegment(segment),
+      toMasterSeconds: (atMs: number) => {
+        const origin = recorderStartedAtRef.current;
+        if (origin == null) return 0;
+        return Math.max(0, (atMs - origin) / 1000);
+      },
+    });
+  }
+
+  // The Frame Processor's per-frame onScore runs on JS (via runOnJS).
+  // We update the motion-bar UI and feed the Segmenter — both cheap.
+  const onScore = (score: number, atMs: number) => {
+    setMotionScore(score);
+    segmenterRef.current?.onScore(score, atMs);
+  };
+
+  const frameOutput = useMotionFrameOutput({ roi, onScore });
 
   // Calibrating → Watching after the warm-up window (ADR-0006). M4 will
   // swap this fixed timeout for the adaptive-baseline-ready signal.
@@ -120,9 +156,17 @@ export function RecordingScreen() {
     return () => clearTimeout(t);
   }, [sessionState, endCalibration]);
 
-  // Start the Master Recording exactly once per Session, on the first render
-  // where the camera device is available. The Setup screen has already put
-  // us into Calibrating before this screen mounts.
+  // Gate the Segmenter on the *post-Calibrating* phase. During Warm-up
+  // we still process frames (the motion-bar UI animates so the user can
+  // see the detector is alive) but the open/close machine ignores them
+  // — Active Segments are not emitted from the Warm-up window per
+  // CONTEXT.md.
+  useEffect(() => {
+    const enabled =
+      sessionState === 'Watching' || sessionState === 'Capturing';
+    segmenterRef.current?.setEnabled(enabled);
+  }, [sessionState]);
+
   useEffect(() => {
     if (!device) return;
     if (!previewStarted) return;
@@ -138,10 +182,16 @@ export function RecordingScreen() {
     startRecording(
       videoOutput,
       recorderRef,
+      () => {
+        const at = Date.now();
+        recorderStartedAtRef.current = at;
+        markRecorderStarted(at);
+      },
       masterUri => {
         onMasterFinished(
           masterUri,
           recordingStartedAt,
+          useSessionStore.getState().segments,
           finishWithSuccess,
           finishWithError,
         );
@@ -154,6 +204,7 @@ export function RecordingScreen() {
     videoOutput,
     sessionState,
     recordingStartedAt,
+    markRecorderStarted,
     finishWithSuccess,
     finishWithError,
   ]);
@@ -162,6 +213,11 @@ export function RecordingScreen() {
     if (stopRequestedRef.current) return;
     if (!recorderRef.current) return;
     stopRequestedRef.current = true;
+    // Close any in-flight Segment before the splice runs — otherwise the
+    // last burst of motion is lost from the Session Recording. Use the
+    // current wall-clock as the close time; the segmenter converts it to
+    // seconds-into-Master via the shared `toMasterSeconds` callback.
+    segmenterRef.current?.forceClose(Date.now());
     const startedAt = recordingStartedAt ?? Date.now();
     beginStopping((Date.now() - startedAt) / 1000);
     try {
@@ -179,7 +235,7 @@ export function RecordingScreen() {
         <Camera
           style={StyleSheet.absoluteFill}
           device={device}
-          outputs={[videoOutput]}
+          outputs={[videoOutput, frameOutput]}
           isActive
           onPreviewStarted={() => {
             console.log('[RecordingScreen] preview started');
@@ -217,6 +273,7 @@ async function startRecording(
   recorderRef: React.MutableRefObject<Awaited<
     ReturnType<CameraVideoOutput['createRecorder']>
   > | null>,
+  onStarted: () => void,
   onFinish: (masterUri: string) => void,
   onError: (message: string) => void,
 ) {
@@ -238,6 +295,12 @@ async function startRecording(
         onError(`recorder: ${err.message}`);
       },
     );
+    // VisionCamera resolves startRecording() when the recorder reports
+    // its onRecordingStarted callback — i.e., from this point on the
+    // Master is actually accumulating frames. M3 uses this as the time
+    // origin for ActiveSegmentRecord offsets.
+    console.log('[RecordingScreen] recorder writing frames');
+    onStarted();
   } catch (e: any) {
     console.warn('[RecordingScreen] startRecording failed', e?.message ?? e);
     onError(`startRecording: ${e?.message ?? e}`);
@@ -247,7 +310,8 @@ async function startRecording(
 async function onMasterFinished(
   masterUri: string,
   recordingStartedAt: number | null,
-  finishWithSuccess: (info: import('../state/sessionMachine').DoneInfo) => void,
+  segments: ActiveSegmentRecord[],
+  finishWithSuccess: (info: DoneInfo) => void,
   finishWithError: (message: string) => void,
 ) {
   const masterDurationS =
@@ -255,9 +319,23 @@ async function onMasterFinished(
   console.log('[RecordingScreen] master finished', {
     masterUri,
     masterDurationS,
+    segmentCount: segments.length,
   });
+
+  if (segments.length === 0) {
+    finishWithError(
+      `No motion was detected inside the Court ROI during this Session, so there's nothing to splice. (Master kept at ${masterUri}. Try lowering START_THRESHOLD in src/detection/config.ts, or check that the ROI covers actual play.)`,
+    );
+    return;
+  }
+
+  const spliceSegments: ActiveSegment[] = segments.map(s => ({
+    startSeconds: s.startSeconds,
+    endSeconds: s.endSeconds,
+  }));
+
   try {
-    const result = await splice(masterUri, HARDCODED_SEGMENTS);
+    const result = await splice(masterUri, spliceSegments);
     console.log('[RecordingScreen] splice ok', result);
     // iOS Add-Only photo-library permission must be requested explicitly;
     // without the prompt, saveAsset rejects with an opaque "Unknown error".
@@ -272,9 +350,9 @@ async function onMasterFinished(
       sessionPhotosId = await saveToPhotos(result.outputUri);
       // Dev-only convenience: mirror the Master into Photos so we can
       // eyeball Master vs Session side-by-side while iterating on
-      // detection (M2–M4). Production (ADR-0007) keeps the Master in the
-      // app sandbox; M5 will add the in-app "My Sessions" library with
-      // user-controlled retention and this branch goes away.
+      // detection (M3–M4). Production (ADR-0007) keeps the Master in
+      // the app sandbox; M5 will add the in-app "My Sessions" library
+      // with user-controlled retention and this branch goes away.
       if (__DEV__) {
         masterPhotosId = await saveToPhotos(masterUri);
       }
@@ -287,15 +365,12 @@ async function onMasterFinished(
       outputDurationMs: result.durationMs,
       sessionPhotosId,
       masterPhotosId,
+      segments,
     });
   } catch (e: any) {
     const message = `splice: ${e?.message ?? e}`;
-    const hint =
-      masterDurationS < 40
-        ? ` (master was ${masterDurationS.toFixed(1)}s; the hardcoded segments need >40s — M3 replaces this with motion-derived segments)`
-        : '';
     console.warn('[RecordingScreen] splice failed', message);
-    finishWithError(message + hint);
+    finishWithError(message);
   }
 }
 
@@ -329,9 +404,8 @@ function StateChip({ state }: { state: SessionState }) {
   );
 }
 
-// Bars are driven by `motionScore` (0..1). Until M3 wires real motion
-// detection this stays at 0, so all bars render at BAR_MIN and the
-// surface stays calm.
+// Bars are driven by `motionScore` (0..1). The Frame Processor pushes
+// updates via runOnJS at SCORE_EMIT_EVERY_N_FRAMES cadence.
 function MotionBars({ motion }: { motion: number }) {
   return (
     <View style={styles.bars}>

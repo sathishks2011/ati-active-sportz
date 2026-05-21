@@ -15,8 +15,22 @@
 
 import React from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView } from 'react-native';
-import { useSessionStore, type DoneInfo } from '../state/sessionMachine';
+import {
+  useSessionStore,
+  type ActiveSegmentRecord,
+  type DoneInfo,
+} from '../state/sessionMachine';
 import { colors, radii, spacing, typography } from '../design/tokens';
+
+function summarizeSegments(segments: ActiveSegmentRecord[]): string {
+  if (segments.length === 0) return '(none)';
+  return segments
+    .map(
+      s =>
+        `${s.startSeconds.toFixed(1)}–${s.endSeconds.toFixed(1)}s (peak ${s.peakScore.toFixed(3)})`,
+    )
+    .join(', ');
+}
 
 export function DoneScreen() {
   const doneInfo = useSessionStore(s => s.doneInfo);
@@ -55,6 +69,7 @@ function DoneStats({ info }: { info: DoneInfo }) {
       />
       <Row k="Splice wall-clock" v={`${info.spliceMs.toFixed(0)} ms`} />
       <Row k="Splice / Master" v={`${ratio.toFixed(3)}×`} />
+      <Row k="Active Segments" v={summarizeSegments(info.segments)} mono />
       <Row k="Session in Photos" v={info.sessionPhotosId ?? '(none)'} mono />
       {info.masterPhotosId && (
         <Row k="Master in Photos (dev)" v={info.masterPhotosId} mono />

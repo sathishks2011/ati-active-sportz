@@ -41,6 +41,17 @@ export type DoneInfo = {
   // diffing Master vs Session). Null in production per ADR-0007 — the
   // Master stays in the app sandbox until M5's in-app library surfaces it.
   masterPhotosId: string | null;
+  segments: ActiveSegmentRecord[];
+};
+
+// An Active Segment as the detector emitted it. Carries diagnostics
+// (peakScore) beyond the bare start/end the Splicer needs, so M3/M4 tuning
+// has the data without re-running a Session. M5's SQLite schema is the
+// long-term home for these.
+export type ActiveSegmentRecord = {
+  startSeconds: number;
+  endSeconds: number;
+  peakScore: number;
 };
 
 // Per CONTEXT.md the Warm-up default is ~15s. Lifted as a constant so M4's
@@ -54,8 +65,17 @@ interface SessionStore {
   motionScore: number;
 
   masterUri: string | null;
+  // Wall-clock at "Auto Record" tap (Setup → Calibrating). Used for the
+  // Master duration we display on Done — includes the small lead-in
+  // between tap and the camera actually rolling.
   recordingStartedAt: number | null;
+  // Wall-clock at the moment VisionCamera signalled the recorder is
+  // actually writing frames (M3 needs this as the time origin for
+  // Active Segment offsets — segment seconds are seconds-into-Master).
+  recorderStartedAt: number | null;
   masterDurationS: number | null;
+
+  segments: ActiveSegmentRecord[];
 
   doneInfo: DoneInfo | null;
   error: string | null;
@@ -66,6 +86,14 @@ interface SessionStore {
 
   beginCalibration: (recordingStartedAt: number) => void;
   endCalibration: () => void;
+  markRecorderStarted: (at: number) => void;
+  // Segmenter callbacks: open transitions Watching → Capturing; close
+  // transitions Capturing → Watching and appends to `segments`. The
+  // segmenter (src/detection/segmenter.ts) owns the open/close logic;
+  // these actions just thread the result through the store so the UI and
+  // the splice both see it.
+  openActiveSegment: () => void;
+  closeActiveSegment: (segment: ActiveSegmentRecord) => void;
   beginStopping: (masterDurationS: number) => void;
   finishWithSuccess: (info: DoneInfo) => void;
   finishWithError: (message: string) => void;
@@ -79,7 +107,9 @@ const initial = {
   motionScore: 0,
   masterUri: null,
   recordingStartedAt: null,
+  recorderStartedAt: null,
   masterDurationS: null,
+  segments: [] as ActiveSegmentRecord[],
   doneInfo: null,
   error: null,
 };
@@ -95,12 +125,21 @@ export const useSessionStore = create<SessionStore>(set => ({
     set({
       sessionState: 'Calibrating',
       recordingStartedAt,
+      recorderStartedAt: null,
       masterUri: null,
       masterDurationS: null,
+      segments: [],
       doneInfo: null,
       error: null,
     }),
   endCalibration: () => set({ sessionState: 'Watching' }),
+  markRecorderStarted: at => set({ recorderStartedAt: at }),
+  openActiveSegment: () => set({ sessionState: 'Capturing' }),
+  closeActiveSegment: segment =>
+    set(state => ({
+      sessionState: 'Watching',
+      segments: [...state.segments, segment],
+    })),
   beginStopping: masterDurationS =>
     set({ sessionState: 'Stopping', masterDurationS }),
   finishWithSuccess: info =>
