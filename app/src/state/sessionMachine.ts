@@ -103,11 +103,17 @@ interface SessionStore {
   // reset(). RecordingScreen reads it to attach the Master URI, append
   // segments, and finalize the row.
   currentSessionId: number | null;
+  // DB id the user tapped on the Dashboard's Recent Sessions list.
+  // Library reads this on mount and highlights the matching card.
+  // Cleared once the highlight has been shown so re-visits don't keep
+  // re-highlighting a stale row.
+  focusedSessionId: number | null;
 
   doneInfo: DoneInfo | null;
   error: string | null;
 
   setAppScreen: (screen: AppScreen) => void;
+  setFocusedSessionId: (id: number | null) => void;
   setRoi: (roi: Roi | null) => void;
   setSetupStep: (step: SetupStep) => void;
   setMotionScore: (m: number) => void;
@@ -145,6 +151,7 @@ const initial = {
   segments: [] as ActiveSegmentRecord[],
   useFixedThreshold: false,
   currentSessionId: null,
+  focusedSessionId: null,
   doneInfo: null,
   error: null,
 };
@@ -153,6 +160,7 @@ export const useSessionStore = create<SessionStore>(set => ({
   ...initial,
 
   setAppScreen: appScreen => set({ appScreen }),
+  setFocusedSessionId: focusedSessionId => set({ focusedSessionId }),
   setRoi: roi => set({ roi }),
   setSetupStep: setupStep => set({ setupStep }),
   setMotionScore: m => set({ motionScore: Math.max(0, Math.min(1, m)) }),

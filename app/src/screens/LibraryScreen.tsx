@@ -40,10 +40,25 @@ type LibraryEntry = {
   masterOnDisk: boolean;
 };
 
+// How long the Recent-Sessions arrival highlight stays on a card before
+// it fades back to the default border. Long enough to register, short
+// enough that the user isn't stuck looking at a "selected" row.
+const FOCUS_HIGHLIGHT_MS = 2_500;
+
 export function LibraryScreen() {
   const setAppScreen = useSessionStore(s => s.setAppScreen);
+  const focusedSessionId = useSessionStore(s => s.focusedSessionId);
+  const setFocusedSessionId = useSessionStore(s => s.setFocusedSessionId);
   const [entries, setEntries] = useState<LibraryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  // Local highlight state — initialized once from the store's
+  // `focusedSessionId` and cleared after FOCUS_HIGHLIGHT_MS. Holding
+  // a local copy means the timeout can also clear the store value
+  // (so re-visiting the Library doesn't re-highlight a stale row)
+  // while keeping the highlight visible for the full duration.
+  const [highlightId, setHighlightId] = useState<number | null>(
+    focusedSessionId,
+  );
 
   const refresh = async () => {
     setLoading(true);
@@ -63,6 +78,15 @@ export function LibraryScreen() {
   useEffect(() => {
     refresh();
   }, []);
+
+  useEffect(() => {
+    if (highlightId == null) return;
+    const t = setTimeout(() => {
+      setHighlightId(null);
+      setFocusedSessionId(null);
+    }, FOCUS_HIGHLIGHT_MS);
+    return () => clearTimeout(t);
+  }, [highlightId, setFocusedSessionId]);
 
   const onDeleteMaster = (entry: LibraryEntry) => {
     if (entry.row.masterUri == null) return;
@@ -95,10 +119,13 @@ export function LibraryScreen() {
     <View style={styles.root}>
       <View style={styles.header}>
         <Pressable
-          onPress={() => setAppScreen('dashboard')}
+          onPress={() => {
+            setFocusedSessionId(null);
+            setAppScreen('dashboard');
+          }}
           style={styles.backBtn}
           accessibilityRole="button"
-          accessibilityLabel="Back to Setup">
+          accessibilityLabel="Back to Dashboard">
           <Text style={styles.backBtnText}>‹ Back</Text>
         </Pressable>
         <Text style={styles.title}>My Sessions</Text>
@@ -116,6 +143,7 @@ export function LibraryScreen() {
             <SessionCard
               key={entry.row.id}
               entry={entry}
+              highlighted={entry.row.id === highlightId}
               onDeleteMaster={() => onDeleteMaster(entry)}
             />
           ))}
@@ -127,9 +155,11 @@ export function LibraryScreen() {
 
 function SessionCard({
   entry,
+  highlighted,
   onDeleteMaster,
 }: {
   entry: LibraryEntry;
+  highlighted: boolean;
   onDeleteMaster: () => void;
 }) {
   const { row, segmentCount, masterOnDisk } = entry;
@@ -137,7 +167,7 @@ function SessionCard({
   const ended = row.endedAtMs != null ? new Date(row.endedAtMs) : null;
   const wallS = ended ? (row.endedAtMs! - row.startedAtMs) / 1000 : null;
   return (
-    <View style={styles.card}>
+    <View style={[styles.card, highlighted && styles.cardHighlighted]}>
       <Text style={styles.cardTitle}>
         {started.toLocaleDateString()} {started.toLocaleTimeString()}
       </Text>
@@ -214,6 +244,13 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     padding: spacing.md,
     gap: spacing.xs,
+  },
+  cardHighlighted: {
+    borderColor: colors.actionStop,
+    // Same warm tint as the ROI-capturing fill so the highlight feels
+    // like a brand-consistent "this is the thing you tapped" cue
+    // rather than a generic selection.
+    backgroundColor: colors.roiCapturingFill,
   },
   cardTitle: {
     ...typography.bodyEmphasis,

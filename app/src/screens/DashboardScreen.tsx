@@ -95,6 +95,7 @@ export function DashboardScreen() {
   // null = not loaded yet; number = byte total (may be 0)
   const [masterBytes, setMasterBytes] = useState<number | null>(null);
   const setAppScreen = useSessionStore(s => s.setAppScreen);
+  const setFocusedSessionId = useSessionStore(s => s.setFocusedSessionId);
   const sessionState = useSessionStore(s => s.sessionState);
   const reset = useSessionStore(s => s.reset);
   const {
@@ -244,14 +245,27 @@ export function DashboardScreen() {
             <View style={styles.recentHeader}>
               <Text style={styles.sectionTitle}>Recent Sessions</Text>
               <Pressable
-                onPress={() => setAppScreen('library')}
+                onPress={() => {
+                  // "See all" is the un-focused entry point — clear
+                  // any prior highlight so the Library opens to its
+                  // default view.
+                  setFocusedSessionId(null);
+                  setAppScreen('library');
+                }}
                 accessibilityRole="button"
                 accessibilityLabel="See all sessions">
                 <Text style={styles.seeAll}>See all ›</Text>
               </Pressable>
             </View>
             {recent.map(entry => (
-              <RecentRow key={entry.row.id} entry={entry} />
+              <RecentRow
+                key={entry.row.id}
+                entry={entry}
+                onPress={() => {
+                  setFocusedSessionId(entry.row.id);
+                  setAppScreen('library');
+                }}
+              />
             ))}
           </View>
         )}
@@ -290,22 +304,39 @@ function EmptyBullet({ children }: { children: React.ReactNode }) {
   );
 }
 
-function RecentRow({ entry }: { entry: RecentEntry }) {
+function RecentRow({
+  entry,
+  onPress,
+}: {
+  entry: RecentEntry;
+  onPress: () => void;
+}) {
   const { row, segmentCount } = entry;
   const started = new Date(row.startedAtMs);
   return (
-    <View style={styles.recentRow}>
-      <Text style={styles.recentRowTitle}>
-        {started.toLocaleDateString()} {started.toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-        })}
-      </Text>
-      <Text style={styles.recentRowMeta}>
-        {segmentCount} segment{segmentCount === 1 ? '' : 's'} ·{' '}
-        {row.usedFixedThreshold ? 'fixed' : 'adaptive'}
-      </Text>
-    </View>
+    <Pressable
+      style={({ pressed }) => [
+        styles.recentRow,
+        pressed && styles.recentRowPressed,
+      ]}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Open Session from ${started.toLocaleString()} in Library`}>
+      <View style={styles.recentRowText}>
+        <Text style={styles.recentRowTitle}>
+          {started.toLocaleDateString()}{' '}
+          {started.toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+          })}
+        </Text>
+        <Text style={styles.recentRowMeta}>
+          {segmentCount} segment{segmentCount === 1 ? '' : 's'} ·{' '}
+          {row.usedFixedThreshold ? 'fixed' : 'adaptive'}
+        </Text>
+      </View>
+      <Text style={styles.recentRowChevron}>›</Text>
+    </Pressable>
   );
 }
 
@@ -531,7 +562,13 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     paddingVertical: spacing.sm + 2,
     paddingHorizontal: spacing.md,
+    flexDirection: 'row',
+    alignItems: 'center',
   },
+  recentRowPressed: {
+    backgroundColor: colors.surfaceSubtle,
+  },
+  recentRowText: { flex: 1 },
   recentRowTitle: {
     ...typography.bodyEmphasis,
     color: colors.text,
@@ -542,5 +579,12 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
     fontSize: 11,
     marginTop: 2,
+  },
+  recentRowChevron: {
+    ...typography.display,
+    color: colors.textSubtle,
+    fontSize: 18,
+    lineHeight: 18,
+    marginLeft: spacing.sm,
   },
 });
