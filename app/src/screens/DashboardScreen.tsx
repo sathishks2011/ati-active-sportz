@@ -35,6 +35,7 @@ import {
   type SessionRow,
 } from '../persistence/sessionRepo';
 import { countForSession } from '../persistence/segmentRepo';
+import { getFileSize } from '../native/Splicer';
 import { colors, radii, spacing, typography } from '../design/tokens';
 
 type DashboardStats = {
@@ -67,10 +68,32 @@ function loadRecent(): RecentEntry[] {
   }));
 }
 
+// Sum Master file bytes across every persisted Session. Done off the
+// JS render path because it crosses the native bridge once per row;
+// the Dashboard renders a "—" placeholder until the first result lands.
+// Sessions whose Master has been deleted (master_uri NULL) or whose
+// file has gone missing simply don't contribute — that's what
+// getFileSize returning 0 already gives us.
+async function loadMasterBytes(): Promise<number> {
+  const rows = listDone();
+  let total = 0;
+  for (const row of rows) {
+    if (row.masterUri == null) continue;
+    try {
+      total += await getFileSize(row.masterUri);
+    } catch {
+      // Best-effort — a single failed stat shouldn't block the card.
+    }
+  }
+  return total;
+}
+
 export function DashboardScreen() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [stats, setStats] = useState<DashboardStats>(loadStats);
   const [recent, setRecent] = useState<RecentEntry[]>(loadRecent);
+  // null = not loaded yet; number = byte total (may be 0)
+  const [masterBytes, setMasterBytes] = useState<number | null>(null);
   const setAppScreen = useSessionStore(s => s.setAppScreen);
   const sessionState = useSessionStore(s => s.sessionState);
   const reset = useSessionStore(s => s.reset);
@@ -87,6 +110,18 @@ export function DashboardScreen() {
     if (appScreen !== 'dashboard') return;
     setStats(loadStats());
     setRecent(loadRecent());
+    setMasterBytes(null);
+    let cancelled = false;
+    loadMasterBytes()
+      .then(bytes => {
+        if (!cancelled) setMasterBytes(bytes);
+      })
+      .catch(() => {
+        if (!cancelled) setMasterBytes(0);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [appScreen]);
 
   const onStart = async () => {
@@ -167,13 +202,23 @@ export function DashboardScreen() {
               value={formatDuration(stats.activeSeconds)}
             />
             <StatCard
+              label="Storage used"
+              value={
+                masterBytes == null ? '…' : formatBytes(masterBytes)
+              }
+              sub={
+                masterBytes != null && masterBytes > 0
+                  ? 'Master files on this device'
+                  : undefined
+              }
+            />
+            <StatCard
               label="Last session"
               value={
                 stats.last
                   ? formatRelative(stats.last.startedAtMs)
                   : '—'
               }
-              wide
             />
           </View>
         )}
@@ -219,16 +264,19 @@ export function DashboardScreen() {
 function StatCard({
   label,
   value,
+  sub,
   wide,
 }: {
   label: string;
   value: string;
+  sub?: string;
   wide?: boolean;
 }) {
   return (
     <View style={[styles.statCard, wide && styles.statCardWide]}>
       <Text style={styles.statLabel}>{label}</Text>
       <Text style={styles.statValue}>{value}</Text>
+      {sub && <Text style={styles.statSub}>{sub}</Text>}
     </View>
   );
 }
@@ -270,6 +318,16 @@ function formatDuration(totalSeconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes <= 0) return '0 B';
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(0)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(mb >= 100 ? 0 : 1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(gb >= 10 ? 1 : 2)} GB`;
 }
 
 function formatRelative(atMs: number): string {
@@ -367,6 +425,11 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 22,
     letterSpacing: 0.6,
+  },
+  statSub: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 10,
   },
 
   emptyCard: {

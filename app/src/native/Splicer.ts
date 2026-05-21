@@ -35,6 +35,7 @@ type SplicerNative = {
   ) => Promise<SpliceResult>;
   fileExists: (path: string) => Promise<boolean>;
   deleteFile: (path: string) => Promise<boolean>;
+  getFileSize: (path: string) => Promise<number>;
   setIdleTimerDisabled: (disabled: boolean) => Promise<void>;
   getSpliceProgress: () => Promise<number>;
   getFreeDiskBytes: () => Promise<number>;
@@ -80,6 +81,15 @@ export function fileExists(path: string): Promise<boolean> {
  */
 export function deleteFile(path: string): Promise<boolean> {
   return requireNative().deleteFile(path);
+}
+
+/**
+ * Returns the byte size of a file, or 0 if it does not exist. Used by
+ * the Dashboard's Storage card — we sum across every known Master to
+ * surface "how much disk Active Sportz is holding onto".
+ */
+export function getFileSize(path: string): Promise<number> {
+  return requireNative().getFileSize(path);
 }
 
 /**

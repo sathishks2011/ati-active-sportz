@@ -256,6 +256,37 @@ class Splicer: NSObject {
     }
   }
 
+  /// Returns the size of the file at the given path or file:// URI in
+  /// bytes. Resolves with 0 if the file does not exist — the Dashboard
+  /// sums these across all known Sessions so a missing file should
+  /// simply not contribute, not throw.
+  @objc func getFileSize(
+    _ path: String,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let url: URL = {
+      if path.hasPrefix("file://") {
+        return URL(string: path) ?? URL(fileURLWithPath: path)
+      }
+      return URL(fileURLWithPath: path)
+    }()
+    if !FileManager.default.fileExists(atPath: url.path) {
+      resolve(NSNumber(value: 0))
+      return
+    }
+    do {
+      let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+      if let size = attrs[.size] as? NSNumber {
+        resolve(size)
+      } else {
+        resolve(NSNumber(value: 0))
+      }
+    } catch {
+      reject("E_FILE_SIZE", "getFileSize failed: \(error.localizedDescription)", error)
+    }
+  }
+
   /// Deletes the file at the given path or file:// URI. Used by the
   /// Library's "Delete Master Recording (keep Session Recording)" action.
   /// Resolves with `true` if a file was removed, `false` if it was already
