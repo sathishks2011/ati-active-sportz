@@ -7,70 +7,116 @@
  * App.tsx; folding it into the splash means recovery feels like part
  * of normal boot rather than an extra screen.
  *
- * Visual: dark background with an orange-tinted honeycomb pattern
- * (Unicode hex glyphs in a staggered grid — no SVG or image assets so
- * the iOS pod list stays unchanged). The wordmark sits centered with
- * a thin orange accent line. Below: a "Volleyball today, more sports
- * coming" line with a row of sport-ball glyphs as a visual tease for
- * the Phase-2 multi-sport expansion called out in CONTEXT.md. The
- * MVP itself remains volleyball-only.
+ * Visual composition:
+ *   - Dark background with a faint scatter of person-doing-sports
+ *     glyphs at very low opacity standing in for "players playing"
+ *     imagery. No image asset is required, so the iOS pod list and
+ *     asset catalog stay untouched. (If you later drop a photographic
+ *     backdrop into ios/.../Images.xcassets, swap the SportFigures
+ *     component for an `<Image source={require(...)}>`.)
+ *   - A single large hexagon centered on the screen — the
+ *     "ActiveSportz" brand mark sits inside it as a watermark.
+ *   - A subtle fade-up animation on the hexagon block so the splash
+ *     feels intentional rather than static.
+ *   - Bottom row of sport-ball glyphs over a "Volleyball today ·
+ *     more sports coming" caption, signalling the Phase-2 multi-sport
+ *     expansion that CONTEXT.md flags. MVP itself remains
+ *     volleyball-only.
  */
 
 import React, { useEffect, useRef } from 'react';
-import { Animated, StyleSheet, Text, View } from 'react-native';
+import {
+  Animated,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
 import { colors, radii, spacing, typography } from '../design/tokens';
 
-const HEX_GLYPH = '⬢'; // ⬢
-const HEX_ROWS = 16;
-const HEX_COLS = 9;
-
+const HEX_GLYPH = '⬢';
 const TAGLINE = 'Auto-recorded gameplay — no manual cuts.';
-const SPORT_GLYPHS = ['🏐', '🎾', '🏀', '⚽'];
-// 🏐 🎾 🏀 ⚽
+const SPORT_BALL_GLYPHS = ['🏐', '🎾', '🏀', '⚽'];
+// People-doing-sport glyphs render as actual player silhouettes on iOS.
+// Coordinates are normalized (0..1) so the layout scales with window size.
+// Roughly arranged around the periphery, leaving the centered hexagon
+// visually uncluttered.
+const SPORT_FIGURES: Array<{
+  glyph: string;
+  x: number;
+  y: number;
+  size: number;
+  rotation?: number;
+}> = [
+  { glyph: '🤾', x: 0.12, y: 0.16, size: 56, rotation: -10 }, // handball
+  { glyph: '⛹️', x: 0.82, y: 0.18, size: 56, rotation: 12 }, // basketball
+  { glyph: '🎾', x: 0.18, y: 0.34, size: 36, rotation: 6 },
+  { glyph: '🏐', x: 0.78, y: 0.36, size: 38, rotation: -8 },
+  { glyph: '🤸', x: 0.1, y: 0.7, size: 52, rotation: 4 }, // cartwheel
+  { glyph: '🏃', x: 0.82, y: 0.66, size: 50, rotation: -6 }, // running
+  { glyph: '🏃‍♀️', x: 0.5, y: 0.86, size: 44 },
+];
 
 export function SplashScreen({ subText }: { subText?: string }) {
-  // Subtle fade-up on the wordmark so the splash feels intentional
-  // rather than static. Cheap, native-driven.
-  const wordmarkOpacity = useRef(new Animated.Value(0)).current;
-  const wordmarkLift = useRef(new Animated.Value(8)).current;
+  const { width: W, height: H } = useWindowDimensions();
+  // Hex sized to a comfortable proportion of the shorter window edge so
+  // it lands big on phones in either orientation.
+  const hexSize = Math.min(W, H) * 0.86;
+
+  const opacity = useRef(new Animated.Value(0)).current;
+  const lift = useRef(new Animated.Value(8)).current;
 
   useEffect(() => {
     Animated.parallel([
-      Animated.timing(wordmarkOpacity, {
+      Animated.timing(opacity, {
         toValue: 1,
         duration: 350,
         useNativeDriver: true,
       }),
-      Animated.timing(wordmarkLift, {
+      Animated.timing(lift, {
         toValue: 0,
         duration: 400,
         useNativeDriver: true,
       }),
     ]).start();
-  }, [wordmarkLift, wordmarkOpacity]);
+  }, [opacity, lift]);
 
   return (
     <View style={styles.root}>
-      <HexPattern />
+      <SportFigures W={W} H={H} />
       <View style={styles.centerColumn} pointerEvents="none">
         <Animated.View
           style={[
-            styles.wordmarkBlock,
+            styles.hexBlock,
             {
-              opacity: wordmarkOpacity,
-              transform: [{ translateY: wordmarkLift }],
+              opacity,
+              transform: [{ translateY: lift }],
+              width: hexSize,
+              height: hexSize,
             },
           ]}>
-          <View style={styles.accentLine} />
-          <Text style={styles.wordmark}>Active Sportz</Text>
-          <View style={styles.accentLine} />
-          <Text style={styles.tagline}>{TAGLINE}</Text>
+          {/* The hexagon itself: a single very-large Unicode glyph
+              tinted in the brand orange at low opacity, with the
+              wordmark overlaid in the geometric center. */}
+          <Text
+            style={[
+              styles.hexShape,
+              { fontSize: hexSize, lineHeight: hexSize },
+            ]}>
+            {HEX_GLYPH}
+          </Text>
+          <View style={styles.watermarkBlock}>
+            <View style={styles.accentLine} />
+            <Text style={styles.watermark}>ActiveSportz</Text>
+            <Text style={styles.tagline}>{TAGLINE}</Text>
+            <View style={styles.accentLine} />
+          </View>
         </Animated.View>
       </View>
       <View style={styles.bottomColumn} pointerEvents="none">
         <View style={styles.sportRow}>
-          {SPORT_GLYPHS.map((g, i) => (
-            <Text key={i} style={styles.sportGlyph}>
+          {SPORT_BALL_GLYPHS.map((g, i) => (
+            <Text key={i} style={styles.sportBallGlyph}>
               {g}
             </Text>
           ))}
@@ -84,26 +130,24 @@ export function SplashScreen({ subText }: { subText?: string }) {
   );
 }
 
-function HexPattern() {
+function SportFigures({ W, H }: { W: number; H: number }) {
   return (
-    <View style={hexStyles.fill} pointerEvents="none">
-      {Array.from({ length: HEX_ROWS }, (_unused, r) => (
-        <View
-          key={r}
-          style={[hexStyles.row, r % 2 === 1 && hexStyles.rowOffset]}>
-          {Array.from({ length: HEX_COLS }, (_unusedCell, c) => (
-            <Text
-              key={c}
-              style={[
-                hexStyles.hex,
-                // Random-ish per-cell intensity for visual texture
-                // without an actual RNG (deterministic so reload is stable).
-                ((r * 7 + c * 13) % 5 === 0) && hexStyles.hexAccent,
-              ]}>
-              {HEX_GLYPH}
-            </Text>
-          ))}
-        </View>
+    <View style={figureStyles.root} pointerEvents="none">
+      {SPORT_FIGURES.map((f, i) => (
+        <Text
+          key={i}
+          style={[
+            figureStyles.figure,
+            {
+              left: f.x * W - f.size / 2,
+              top: f.y * H - f.size / 2,
+              fontSize: f.size,
+              lineHeight: f.size * 1.1,
+              transform: f.rotation ? [{ rotate: `${f.rotation}deg` }] : [],
+            },
+          ]}>
+          {f.glyph}
+        </Text>
       ))}
     </View>
   );
@@ -118,30 +162,40 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFill,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: spacing.lg,
   },
-  wordmarkBlock: {
+  hexBlock: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  hexShape: {
+    position: 'absolute',
+    color: colors.actionStop, // warm brand orange
+    opacity: 0.22,
+    textAlign: 'center',
+  },
+  watermarkBlock: {
     alignItems: 'center',
     gap: spacing.md,
+    paddingHorizontal: spacing.xl,
   },
   accentLine: {
-    width: 120,
+    width: 80,
     height: 2,
-    backgroundColor: colors.actionStop, // warm orange accent
+    backgroundColor: colors.actionStop,
     borderRadius: radii.sm,
   },
-  wordmark: {
+  watermark: {
     ...typography.display,
     color: colors.text,
-    fontSize: 38,
-    letterSpacing: 2,
+    fontSize: 36,
+    letterSpacing: 2.5,
   },
   tagline: {
     ...typography.body,
     color: colors.textMuted,
-    fontSize: 14,
+    fontSize: 13,
     textAlign: 'center',
-    maxWidth: 280,
+    maxWidth: 240,
   },
   bottomColumn: {
     position: 'absolute',
@@ -155,7 +209,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     gap: spacing.lg,
   },
-  sportGlyph: {
+  sportBallGlyph: {
     fontSize: 28,
     opacity: 0.85,
   },
@@ -174,28 +228,12 @@ const styles = StyleSheet.create({
   },
 });
 
-const hexStyles = StyleSheet.create({
-  fill: {
+const figureStyles = StyleSheet.create({
+  root: {
     ...StyleSheet.absoluteFill,
-    overflow: 'hidden',
-    opacity: 0.18,
-    justifyContent: 'center',
+    opacity: 0.12,
   },
-  row: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 14,
-  },
-  rowOffset: {
-    marginLeft: 22,
-  },
-  hex: {
-    fontSize: 40,
-    color: colors.stateSoft.calibrating, // muted amber-orange
-    lineHeight: 44,
-  },
-  hexAccent: {
-    color: colors.actionStop, // bright orange highlight on ~20% of cells
-    opacity: 1,
+  figure: {
+    position: 'absolute',
   },
 });
