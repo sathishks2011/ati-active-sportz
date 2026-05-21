@@ -33,7 +33,6 @@ import {
   Pressable,
   StyleSheet,
   Animated,
-  ActivityIndicator,
   AppState,
   type AppStateStatus,
 } from 'react-native';
@@ -49,9 +48,13 @@ import {
   iosRequestAddOnlyGalleryPermission,
 } from '@react-native-camera-roll/camera-roll';
 import {
+  getSpliceProgress,
+  getThermalState,
+  scheduleLocalNotification,
   setIdleTimerDisabled,
   splice,
   type ActiveSegment,
+  type ThermalState,
 } from '../native/Splicer';
 import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
 import {
@@ -118,6 +121,11 @@ export function RecordingScreen() {
   const beginStopping = useSessionStore(s => s.beginStopping);
   const finishWithSuccess = useSessionStore(s => s.finishWithSuccess);
   const finishWithError = useSessionStore(s => s.finishWithError);
+
+  // M7 polish state: splice progress for the Stopping screen, thermal
+  // pressure for an in-Session warning badge.
+  const [spliceProgress, setSpliceProgress] = useState(0);
+  const [thermalState, setThermalState] = useState<ThermalState>('nominal');
 
   const recorderRef = useRef<Awaited<
     ReturnType<CameraVideoOutput['createRecorder']>
@@ -340,10 +348,56 @@ export function RecordingScreen() {
     const handle = (status: AppStateStatus) => {
       if (status !== 'background') return;
       console.log('[RecordingScreen] AppState → background, stopping Session');
+      // Best-effort: schedule a local notification so the user sees that
+      // the OS interruption was handled even before they reopen the app.
+      // If permission is denied this just no-ops.
+      scheduleLocalNotification(
+        'Session ended early',
+        'Active Sportz backgrounded — your recording is being saved.',
+      ).catch(e =>
+        console.warn('[RecordingScreen] scheduleLocalNotification failed', e?.message ?? e),
+      );
       onStopRef.current();
     };
     const sub = AppState.addEventListener('change', handle);
     return () => sub.remove();
+  }, []);
+
+  // Poll splice progress while Stopping so the user sees forward motion
+  // rather than a hung spinner. Cheap: native getter just reads
+  // exporter.progress; no allocation per tick.
+  useEffect(() => {
+    if (sessionState !== 'Stopping') {
+      setSpliceProgress(0);
+      return;
+    }
+    const t = setInterval(() => {
+      getSpliceProgress()
+        .then(setSpliceProgress)
+        .catch(() => {});
+    }, 100);
+    return () => clearInterval(t);
+  }, [sessionState]);
+
+  // Sample thermal state once a minute while the screen is up. We don't
+  // need higher resolution — thermal pressure builds over minutes, not
+  // frames, and a heavier cadence would waste battery for no UX gain.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await getThermalState();
+        if (!cancelled) setThermalState(s);
+      } catch {
+        /* ignore */
+      }
+    };
+    tick();
+    const t = setInterval(tick, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, []);
 
   return (
@@ -379,6 +433,19 @@ export function RecordingScreen() {
         />
         <MotionBars motion={motionScore} />
       </View>
+      {(thermalState === 'serious' || thermalState === 'critical') && (
+        <View style={styles.thermalBanner} pointerEvents="none">
+          <Text style={styles.thermalBannerText}>
+            iPhone is running hot ({thermalState}). Plug in or move to a
+            cooler spot — recording continues.
+          </Text>
+        </View>
+      )}
+      {sessionState !== 'Stopping' && (
+        <Text style={styles.lockHint} pointerEvents="none">
+          Keep the phone awake — locking ends the Session.
+        </Text>
+      )}
       {sessionState === 'Calibrating' && (
         <CalibratingPanel
           recordingStartedAt={recordingStartedAt}
@@ -386,7 +453,7 @@ export function RecordingScreen() {
         />
       )}
       {sessionState === 'Stopping' ? (
-        <StoppingPanel />
+        <StoppingPanel progress={spliceProgress} />
       ) : (
         <StopFab onPress={onStop} />
       )}
@@ -422,9 +489,9 @@ function CalibratingPanel({
         style={styles.skipBtn}
         onPress={onSkip}
         accessibilityRole="button"
-        accessibilityLabel="Skip calibration"
+        accessibilityLabel="Skip Warm-up"
         accessibilityHint="Falls back to fixed-threshold detection (reduced accuracy)">
-        <Text style={styles.skipBtnText}>Skip calibration</Text>
+        <Text style={styles.skipBtnText}>Skip Warm-up</Text>
       </Pressable>
     </View>
   );
@@ -663,11 +730,28 @@ function StopFab({ onPress }: { onPress: () => void }) {
   );
 }
 
-function StoppingPanel() {
+function StoppingPanel({ progress }: { progress: number }) {
+  // `progress` is 0..1. Clamp + format for display; the native getter
+  // never returns negatives but the initial sub-100ms tick will show
+  // "Preparing…" before the first progress sample arrives.
+  const pct = Math.max(0, Math.min(1, progress));
   return (
     <View style={styles.stoppingPanel} pointerEvents="none">
-      <ActivityIndicator color={colors.text} size="large" />
       <Text style={styles.stoppingText}>Stopping… stitching your video</Text>
+      <View style={styles.progressTrack}>
+        <View
+          style={[
+            styles.progressFill,
+            { width: (`${(pct * 100).toFixed(1)}%`) as `${number}%` },
+          ]}
+        />
+      </View>
+      <Text style={styles.progressLabel}>
+        {pct === 0 ? 'Preparing…' : `${Math.round(pct * 100)}%`}
+      </Text>
+      <Text style={styles.stoppingHint}>
+        Keep the phone awake — locking will interrupt the save.
+      </Text>
     </View>
   );
 }
@@ -765,6 +849,58 @@ const styles = StyleSheet.create({
   stoppingText: {
     ...typography.bodyEmphasis,
     color: colors.text,
+  },
+  stoppingHint: {
+    ...typography.caption,
+    color: colors.textMuted,
+    fontSize: 11,
+    textAlign: 'center',
+  },
+  progressTrack: {
+    width: '100%',
+    height: 8,
+    borderRadius: radii.sm,
+    backgroundColor: colors.surfaceSubtle,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: colors.actionStart,
+  },
+  progressLabel: {
+    ...typography.mono,
+    color: colors.text,
+    fontSize: 13,
+  },
+  thermalBanner: {
+    position: 'absolute',
+    top: 116,
+    left: spacing.base,
+    right: spacing.base,
+    padding: spacing.md,
+    borderRadius: radii.lg,
+    backgroundColor: colors.state.capturing,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  thermalBannerText: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  lockHint: {
+    position: 'absolute',
+    top: 96,
+    left: spacing.base,
+    right: spacing.base,
+    ...typography.caption,
+    color: colors.textMuted,
+    fontSize: 10,
+    textAlign: 'center',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    ...overlayShadow,
   },
   calibratingPanel: {
     position: 'absolute',

@@ -15,6 +15,7 @@
 
 import React, { useRef, useState } from 'react';
 import {
+  Alert,
   View,
   Text,
   Pressable,
@@ -31,6 +32,18 @@ import {
 } from '../state/sessionMachine';
 import { colors, radii, spacing, typography } from '../design/tokens';
 import { openSession } from '../persistence/sessionRepo';
+import {
+  getFreeDiskBytes,
+  requestNotificationPermission,
+} from '../native/Splicer';
+
+// Refuse to start a Session when free disk is below this. Conservative
+// budget: 1080p hardware H.264 at the resolutions VisionCamera defaults
+// to lands around ~3–6 GB per 90 minutes (ADR-0007). 2 GB at least
+// guarantees ~30 minutes of headroom, so the user is never surprised
+// mid-match by a "no space" error. The Library's "Delete Master" lets
+// them free space without losing prior recordings.
+const MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024;
 
 // Reject accidental taps / fingernail-sized rectangles. 5% of each axis is
 // large enough to be intentional, small enough that "draw around the
@@ -151,7 +164,34 @@ function Step2() {
     return null;
   }
 
-  const onConfirm = () => {
+  const onConfirm = async () => {
+    // Pre-flight disk check (M7). Surface a friendly Alert and bail
+    // before opening the Session row — better to refuse here than
+    // crash the splice 90 minutes from now with "No space on device".
+    try {
+      const free = await getFreeDiskBytes();
+      if (free < MIN_FREE_DISK_BYTES) {
+        const gb = (free / (1024 ** 3)).toFixed(1);
+        Alert.alert(
+          'Not enough storage',
+          `Your iPhone only has ${gb} GB free. Recording a match safely needs at least 2 GB. Free up some space (or delete old Masters from My Sessions) and try again.`,
+        );
+        return;
+      }
+    } catch (e: any) {
+      console.warn('[SetupScreen] disk check failed', e?.message ?? e);
+      // Fall through — better to attempt the Session than block it on
+      // a diagnostic failure. The splice will surface the real error
+      // if one shows up later.
+    }
+
+    // Best-effort notification permission so M6's background-stop path
+    // can fire the "Session ended early" alert. Non-blocking — we
+    // continue regardless of the user's choice.
+    requestNotificationPermission().catch(e =>
+      console.warn('[SetupScreen] notification permission failed', e?.message ?? e),
+    );
+
     // Persist the Session row up-front so crash-recovery (M5) has
     // somewhere to land if the app dies before the recorder finalizes.
     const startedAt = Date.now();

@@ -13,9 +13,16 @@ import Foundation
 import AVFoundation
 import React
 import UIKit
+import UserNotifications
 
 @objc(Splicer)
 class Splicer: NSObject {
+
+  /// The export session for the most recent in-flight splice. Held as an
+  /// instance var so JS can poll progress via `getSpliceProgress()` —
+  /// we only ever run one splice at a time (single user, single Session),
+  /// so the lack of an id is fine.
+  private var currentExporter: AVAssetExportSession?
 
   @objc static func requiresMainQueueSetup() -> Bool {
     return false
@@ -98,8 +105,12 @@ class Splicer: NSObject {
     exporter.outputURL = outputURL
     exporter.outputFileType = .mp4
     exporter.shouldOptimizeForNetworkUse = false
+    self.currentExporter = exporter
 
     exporter.exportAsynchronously {
+      // Clear the polled reference before resolving/rejecting so a tail
+      // poll from JS sees the cleared state and stops asking.
+      self.currentExporter = nil
       switch exporter.status {
       case .completed:
         let elapsedMs = (CFAbsoluteTimeGetCurrent() - started) * 1000.0
@@ -117,6 +128,18 @@ class Splicer: NSObject {
     }
   }
 
+  /// Returns the current splice progress as a Double in 0..1, or 0 if no
+  /// splice is in flight. Polled by JS from the Stopping screen to drive
+  /// the progress bar — call cadence is ~100ms which is cheap compared
+  /// to the per-frame work AVAssetExportSession is doing internally.
+  @objc func getSpliceProgress(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let progress = self.currentExporter?.progress ?? 0
+    resolve(NSNumber(value: progress))
+  }
+
   /// Returns whether a file exists at the given path or file:// URI. Used by
   /// M5's crash-recovery sweep to filter persisted Sessions whose Master file
   /// has gone missing from the caches directory.
@@ -132,6 +155,90 @@ class Splicer: NSObject {
       return URL(fileURLWithPath: path)
     }()
     resolve(FileManager.default.fileExists(atPath: url.path))
+  }
+
+  /// Returns the bytes of free disk space available on the volume the app's
+  /// caches directory lives on. Used by the Setup screen's Auto-Record
+  /// tap to refuse to start when the disk is too full to hold a
+  /// reasonable Master file.
+  @objc func getFreeDiskBytes(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    do {
+      let values = try cachesDir.resourceValues(forKeys: [.volumeAvailableCapacityForOpportunisticUsageKey])
+      if let bytes = values.volumeAvailableCapacityForOpportunisticUsage {
+        resolve(NSNumber(value: bytes))
+        return
+      }
+      // Fall through to the older API if the modern key is unavailable.
+      let attrs = try FileManager.default.attributesOfFileSystem(forPath: cachesDir.path)
+      if let n = attrs[.systemFreeSize] as? NSNumber {
+        resolve(n)
+        return
+      }
+      reject("E_DISK_UNKNOWN", "Could not determine free disk bytes", nil)
+    } catch {
+      reject("E_DISK_FAILED", "getFreeDiskBytes failed: \(error.localizedDescription)", error)
+    }
+  }
+
+  /// Returns the current thermal pressure as a string: "nominal", "fair",
+  /// "serious", or "critical". The Recording screen polls this to surface
+  /// a warning badge so the user knows when to plug in / cool down.
+  @objc func getThermalState(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let state = ProcessInfo.processInfo.thermalState
+    let s: String
+    switch state {
+    case .nominal: s = "nominal"
+    case .fair: s = "fair"
+    case .serious: s = "serious"
+    case .critical: s = "critical"
+    @unknown default: s = "nominal"
+    }
+    resolve(s)
+  }
+
+  /// Requests notification permission (alerts only — we never play sound
+  /// or badge). Resolves with the granted Bool. Safe to call repeatedly.
+  @objc func requestNotificationPermission(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { granted, error in
+      if let error = error {
+        reject("E_NOTIF_PERM", error.localizedDescription, error)
+        return
+      }
+      resolve(NSNumber(value: granted))
+    }
+  }
+
+  /// Fires (or schedules a 0-second trigger for) a local notification with
+  /// the given title + body. Used by the M6 background-stop path so the
+  /// user gets feedback that the OS interruption was handled.
+  @objc func scheduleLocalNotification(
+    _ title: String,
+    body: String,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let content = UNMutableNotificationContent()
+    content.title = title
+    content.body = body
+    let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+    let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
+    UNUserNotificationCenter.current().add(req) { error in
+      if let error = error {
+        reject("E_NOTIF_SCHEDULE", error.localizedDescription, error)
+      } else {
+        resolve(nil)
+      }
+    }
   }
 
   /// Sets `UIApplication.shared.isIdleTimerDisabled` so the screen stays

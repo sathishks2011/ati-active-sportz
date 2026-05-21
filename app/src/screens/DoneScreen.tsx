@@ -71,7 +71,7 @@ function DoneStats({ info }: { info: DoneInfo }) {
       <Row k="Splice / Master" v={`${ratio.toFixed(3)}×`} />
       <Row
         k="Detection mode"
-        v={info.usedFixedThreshold ? 'fixed-threshold (Skip Calibration)' : 'adaptive baseline'}
+        v={info.usedFixedThreshold ? 'fixed-threshold (Skip Warm-up)' : 'adaptive baseline'}
       />
       <Row k="Active Segments" v={summarizeSegments(info.segments)} mono />
       <Row k="Session in Photos" v={info.sessionPhotosId ?? '(none)'} mono />

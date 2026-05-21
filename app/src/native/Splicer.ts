@@ -26,6 +26,8 @@ export type SpliceResult = {
   spliceMs: number;
 };
 
+export type ThermalState = 'nominal' | 'fair' | 'serious' | 'critical';
+
 type SplicerNative = {
   splice: (
     masterPath: string,
@@ -34,6 +36,11 @@ type SplicerNative = {
   fileExists: (path: string) => Promise<boolean>;
   deleteFile: (path: string) => Promise<boolean>;
   setIdleTimerDisabled: (disabled: boolean) => Promise<void>;
+  getSpliceProgress: () => Promise<number>;
+  getFreeDiskBytes: () => Promise<number>;
+  getThermalState: () => Promise<ThermalState>;
+  requestNotificationPermission: () => Promise<boolean>;
+  scheduleLocalNotification: (title: string, body: string) => Promise<void>;
 };
 
 const native = NativeModules.Splicer as SplicerNative | undefined;
@@ -82,4 +89,49 @@ export function deleteFile(path: string): Promise<boolean> {
  */
 export function setIdleTimerDisabled(disabled: boolean): Promise<void> {
   return requireNative().setIdleTimerDisabled(disabled);
+}
+
+/**
+ * Polled by the Stopping screen to drive the splice progress bar.
+ * Returns 0..1; 0 if no splice is in flight.
+ */
+export function getSpliceProgress(): Promise<number> {
+  return requireNative().getSpliceProgress();
+}
+
+/**
+ * Free bytes on the volume hosting the caches directory (where
+ * VisionCamera writes the Master). Used as a pre-flight check at
+ * "Auto Record" — we refuse to start a Session that can't realistically
+ * be stored to disk.
+ */
+export function getFreeDiskBytes(): Promise<number> {
+  return requireNative().getFreeDiskBytes();
+}
+
+/**
+ * Snapshot of `ProcessInfo.processInfo.thermalState`. Polled during
+ * Sessions so the UI can warn when iOS reports thermal pressure.
+ */
+export function getThermalState(): Promise<ThermalState> {
+  return requireNative().getThermalState();
+}
+
+/**
+ * Requests local-notification permission (alert only, no sound/badge).
+ * Resolves with whether the user granted it. Safe to call repeatedly.
+ */
+export function requestNotificationPermission(): Promise<boolean> {
+  return requireNative().requestNotificationPermission();
+}
+
+/**
+ * Schedules a local notification ~1s out. Used by the M6 background-stop
+ * path so the user sees feedback that the OS interruption was handled.
+ */
+export function scheduleLocalNotification(
+  title: string,
+  body: string,
+): Promise<void> {
+  return requireNative().scheduleLocalNotification(title, body);
 }
