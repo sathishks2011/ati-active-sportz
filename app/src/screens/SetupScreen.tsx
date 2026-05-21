@@ -26,12 +26,15 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { runOnJS } from 'react-native-reanimated';
 import { CameraBackdrop } from '../components/CameraBackdrop';
 import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
+import { DrawerMenu } from '../components/DrawerMenu';
 import {
   useSessionStore,
   type Roi,
 } from '../state/sessionMachine';
+import { useSettingsStore } from '../state/settingsStore';
 import { colors, radii, spacing, typography } from '../design/tokens';
 import { openSession } from '../persistence/sessionRepo';
+import { markFixedThreshold } from '../persistence/sessionRepo';
 import {
   getFreeDiskBytes,
   requestNotificationPermission,
@@ -54,15 +57,24 @@ type Drag = { x1: number; y1: number; x2: number; y2: number } | null;
 
 export function SetupScreen() {
   const step = useSessionStore(s => s.setupStep);
-  return step === 1 ? <Step1 /> : <Step2 />;
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  return (
+    <View style={styles.root}>
+      {step === 1 ? (
+        <Step1 onOpenMenu={() => setDrawerOpen(true)} />
+      ) : (
+        <Step2 />
+      )}
+      <DrawerMenu open={drawerOpen} onClose={() => setDrawerOpen(false)} />
+    </View>
+  );
 }
 
-function Step1() {
+function Step1({ onOpenMenu }: { onOpenMenu: () => void }) {
   const { width: W, height: H } = useWindowDimensions();
   const roi = useSessionStore(s => s.roi);
   const setRoi = useSessionStore(s => s.setRoi);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
-  const setAppScreen = useSessionStore(s => s.setAppScreen);
 
   const [drag, setDragState] = useState<Drag>(null);
   const dragRef = useRef<Drag>(null);
@@ -127,11 +139,13 @@ function Step1() {
         </View>
       </GestureDetector>
       <Pressable
-        style={styles.libraryLink}
-        onPress={() => setAppScreen('library')}
+        style={styles.menuBtn}
+        onPress={onOpenMenu}
         accessibilityRole="button"
-        accessibilityLabel="Open My Sessions library">
-        <Text style={styles.libraryLinkText}>My Sessions ›</Text>
+        accessibilityLabel="Open menu">
+        <View style={styles.menuIconBar} />
+        <View style={styles.menuIconBar} />
+        <View style={styles.menuIconBar} />
       </Pressable>
       <View style={styles.footerBar} pointerEvents="box-none">
         <Pressable
@@ -157,6 +171,8 @@ function Step2() {
   const roi = useSessionStore(s => s.roi);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
   const beginCalibration = useSessionStore(s => s.beginCalibration);
+  const skipCalibration = useSessionStore(s => s.skipCalibration);
+  const alwaysSkipWarmup = useSettingsStore(s => s.alwaysSkipWarmup);
 
   // Step 2 is unreachable without a valid ROI (Next is disabled in Step 1),
   // but the type system doesn't know that — short-circuit defensively.
@@ -197,6 +213,18 @@ function Step2() {
     const startedAt = Date.now();
     const sessionId = openSession({ startedAtMs: startedAt, roi });
     beginCalibration(startedAt, sessionId);
+    if (alwaysSkipWarmup) {
+      // Honour the Settings opt-out — the user has told us they
+      // routinely arrive mid-match, so the baseline can't learn a
+      // clean idle court. Flip straight into Watching with the
+      // fixed-threshold detector and mirror the choice to DB.
+      skipCalibration();
+      try {
+        markFixedThreshold(sessionId);
+      } catch (e: any) {
+        console.warn('[SetupScreen] markFixedThreshold failed', e?.message ?? e);
+      }
+    }
   };
 
   return (
@@ -325,20 +353,24 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 14,
   },
-  libraryLink: {
+  menuBtn: {
     position: 'absolute',
     top: 60,
-    right: spacing.base,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-    borderRadius: radii.pill,
+    left: spacing.base,
+    width: 44,
+    height: 44,
+    borderRadius: radii.md,
     backgroundColor: colors.surfacePanel,
     borderWidth: 1,
     borderColor: colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
   },
-  libraryLinkText: {
-    ...typography.bodyEmphasis,
-    color: colors.text,
-    fontSize: 12,
+  menuIconBar: {
+    width: 20,
+    height: 2,
+    borderRadius: 1,
+    backgroundColor: colors.text,
   },
 });

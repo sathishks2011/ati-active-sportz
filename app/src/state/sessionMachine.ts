@@ -32,12 +32,12 @@ export type SessionState =
 export type SetupStep = 1 | 2;
 
 // Top-level "screen" routing dimension orthogonal to `sessionState`.
-// The Library is a sibling destination to the Setup/Recording/Done
-// flow — it's not part of a Session's lifecycle, so it doesn't
+// The drawer destinations are siblings to the Setup/Recording/Done
+// flow — they're not part of a Session's lifecycle, so they don't
 // belong in `sessionState`. Most of the app stays on 'session' and
-// `sessionState` decides which screen mounts; 'library' overrides
-// that to show the M5 Sessions list.
-export type AppScreen = 'session' | 'library';
+// `sessionState` decides which screen mounts; the others override
+// that to show their respective screens.
+export type AppScreen = 'session' | 'library' | 'settings' | 'about';
 
 export type DoneInfo = {
   masterUri: string;

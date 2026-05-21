@@ -2,21 +2,21 @@
  * Active Sportz — production app shell.
  *
  * Routing is driven by two store fields:
- *   - `appScreen`: 'session' | 'library'. The Library is a sibling to
- *     the Setup/Recording/Done flow, not a sub-state of it (M5).
- *   - `sessionState`: when `appScreen === 'session'`, decides which of
- *     Setup / Recording / Done to mount.
+ *   - `appScreen`: 'session' | 'library' | 'settings' | 'about'. The
+ *     drawer destinations are siblings to the Setup/Recording/Done
+ *     flow.
+ *   - `sessionState`: when `appScreen === 'session'`, decides which
+ *     of Setup / Recording / Done to mount.
  *
- * On launch: run the M5 crash-recovery sweep before any screen mounts.
- * Per ADR-0007 it's silent — we show a brief "Restoring previous
- * Sessions…" overlay only while the sweep is in flight, and only if
- * there's anything to inspect. Once the sweep is done the normal
- * routing takes over and any finalized orphans appear in the Library.
+ * On launch: a brief branded splash overlays everything while the
+ * M5 crash-recovery sweep runs. The splash dismisses when both
+ * elapsed >= 1.5s AND the sweep has finished — so the user always
+ * sees the wordmark for at least one beat and the boot feels like
+ * one continuous animation rather than a fight between loaders.
  */
 
 import React, { useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
   StatusBar,
   StyleSheet,
   Text,
@@ -30,12 +30,16 @@ import { SetupScreen } from './src/screens/SetupScreen';
 import { RecordingScreen } from './src/screens/RecordingScreen';
 import { DoneScreen } from './src/screens/DoneScreen';
 import { LibraryScreen } from './src/screens/LibraryScreen';
+import { SettingsScreen } from './src/screens/SettingsScreen';
+import { AboutScreen } from './src/screens/AboutScreen';
+import { SplashScreen } from './src/screens/SplashScreen';
 import {
   isSessionRunning,
   useSessionStore,
 } from './src/state/sessionMachine';
 import { finalizeOrphanedSessions } from './src/recovery/finalizeOrphanedSessions';
-import { colors, typography, spacing } from './src/design/tokens';
+
+const SPLASH_MIN_MS = 1_500;
 
 function App() {
   return (
@@ -43,9 +47,9 @@ function App() {
       <GestureHandlerRootView style={styles.root}>
         <StatusBar barStyle="light-content" />
         <CameraPermissionGate>
-          <RecoveryGate>
+          <BootGate>
             <ActiveScreen />
-          </RecoveryGate>
+          </BootGate>
         </CameraPermissionGate>
       </GestureHandlerRootView>
     </SafeAreaProvider>
@@ -55,38 +59,51 @@ function App() {
 function ActiveScreen() {
   const appScreen = useSessionStore(s => s.appScreen);
   const sessionState = useSessionStore(s => s.sessionState);
-  if (appScreen === 'library') {
-    return <LibraryScreen />;
-  }
-  if (sessionState === 'Setup') {
-    return <SetupScreen />;
-  }
-  if (sessionState === 'Done') {
-    return <DoneScreen />;
-  }
-  if (isSessionRunning(sessionState)) {
-    return <RecordingScreen />;
-  }
+  if (appScreen === 'library') return <LibraryScreen />;
+  if (appScreen === 'settings') return <SettingsScreen />;
+  if (appScreen === 'about') return <AboutScreen />;
+  if (sessionState === 'Setup') return <SetupScreen />;
+  if (sessionState === 'Done') return <DoneScreen />;
+  if (isSessionRunning(sessionState)) return <RecordingScreen />;
   return null;
 }
 
-function RecoveryGate({ children }: { children: React.ReactNode }) {
-  const [done, setDone] = useState(false);
-  const [restoringCount, setRestoringCount] = useState(0);
+/**
+ * Holds the splash until (a) the SPLASH_MIN_MS beat has elapsed AND
+ * (b) the recovery sweep has finished. Either alone would feel wrong
+ * — a sub-second splash flashes weirdly on cold start, and dismissing
+ * before recovery means we'd briefly land on Setup before the
+ * sweep silently rewrites state.
+ */
+function BootGate({ children }: { children: React.ReactNode }) {
+  const [timeElapsed, setTimeElapsed] = useState(false);
+  const [recoveryDone, setRecoveryDone] = useState(false);
+  const [recoveryNote, setRecoveryNote] = useState<string | undefined>(
+    undefined,
+  );
+
+  useEffect(() => {
+    const t = setTimeout(() => setTimeElapsed(true), SPLASH_MIN_MS);
+    return () => clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
         const result = await finalizeOrphanedSessions();
-        if (!cancelled) {
-          setRestoringCount(result.inspected);
-          setDone(true);
+        if (cancelled) return;
+        if (result.inspected > 0) {
+          setRecoveryNote(
+            `Restored ${result.finalized + result.abandoned} previous Session${
+              result.inspected === 1 ? '' : 's'
+            }.`,
+          );
         }
-        console.log('[App] recovery sweep', result);
+        setRecoveryDone(true);
       } catch (e: any) {
         console.warn('[App] recovery sweep failed', e?.message ?? e);
-        if (!cancelled) setDone(true);
+        if (!cancelled) setRecoveryDone(true);
       }
     })();
     return () => {
@@ -94,21 +111,17 @@ function RecoveryGate({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  if (!done) {
-    return (
-      <View style={styles.recoveryRoot}>
-        <ActivityIndicator color={colors.text} size="large" />
-        <Text style={styles.recoveryText}>Restoring previous Sessions…</Text>
-      </View>
-    );
-  }
-  // Silent on the happy path — no toast, no dialog. The Library shows
-  // the recovered Sessions, which is the only feedback ADR-0007 wants.
-  // We only log the count for visibility while we shake this out.
-  if (restoringCount > 0) {
-    console.log(`[App] recovery surfaced ${restoringCount} session(s)`);
-  }
-  return <>{children}</>;
+  const ready = timeElapsed && recoveryDone;
+  return (
+    <>
+      {children}
+      {!ready && (
+        <View style={StyleSheet.absoluteFill}>
+          <SplashScreen subText={recoveryNote} />
+        </View>
+      )}
+    </>
+  );
 }
 
 function CameraPermissionGate({ children }: { children: React.ReactNode }) {
@@ -160,19 +173,6 @@ const styles = StyleSheet.create({
     borderRadius: 999,
   },
   btnText: { color: '#111', fontSize: 14, fontWeight: '700' },
-  recoveryRoot: {
-    flex: 1,
-    backgroundColor: colors.bg,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.lg,
-    padding: spacing.xl,
-  },
-  recoveryText: {
-    ...typography.body,
-    color: colors.textMuted,
-    textAlign: 'center',
-  },
 });
 
 export default App;
