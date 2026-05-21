@@ -69,6 +69,10 @@ function DoneStats({ info }: { info: DoneInfo }) {
       />
       <Row k="Splice wall-clock" v={`${info.spliceMs.toFixed(0)} ms`} />
       <Row k="Splice / Master" v={`${ratio.toFixed(3)}×`} />
+      <Row
+        k="Detection mode"
+        v={info.usedFixedThreshold ? 'fixed-threshold (Skip Calibration)' : 'adaptive baseline'}
+      />
       <Row k="Active Segments" v={summarizeSegments(info.segments)} mono />
       <Row k="Session in Photos" v={info.sessionPhotosId ?? '(none)'} mono />
       {info.masterPhotosId && (

@@ -64,7 +64,10 @@ import {
   spacing,
   typography,
 } from '../design/tokens';
-import { useMotionFrameOutput } from '../detection/motionFrameProcessor';
+import {
+  useMotionFrameOutput,
+  type MotionPhase,
+} from '../detection/motionFrameProcessor';
 import { Segmenter } from '../detection/segmenter';
 
 const BAR_COUNT = 5;
@@ -93,7 +96,9 @@ export function RecordingScreen() {
   const roi = useSessionStore(s => s.roi);
   const motionScore = useSessionStore(s => s.motionScore);
   const setMotionScore = useSessionStore(s => s.setMotionScore);
+  const useFixedThreshold = useSessionStore(s => s.useFixedThreshold);
   const endCalibration = useSessionStore(s => s.endCalibration);
+  const skipCalibration = useSessionStore(s => s.skipCalibration);
   const markRecorderStarted = useSessionStore(s => s.markRecorderStarted);
   const openActiveSegment = useSessionStore(s => s.openActiveSegment);
   const closeActiveSegment = useSessionStore(s => s.closeActiveSegment);
@@ -146,7 +151,19 @@ export function RecordingScreen() {
     segmenterRef.current?.onScore(score, atMs);
   };
 
-  const frameOutput = useMotionFrameOutput({ roi, onScore });
+  // Detection phase (ADR-0006 / M4):
+  //   - Skip Calibration tapped → `fixed` for the entire Session (M3
+  //     fallback, no usable baseline learned).
+  //   - Otherwise: `warmup` during Calibrating (baseline accumulates,
+  //     no Segments emit), `detect` once Watching begins (score is
+  //     deviation-from-baseline).
+  const phase: MotionPhase = useFixedThreshold
+    ? 'fixed'
+    : sessionState === 'Calibrating'
+      ? 'warmup'
+      : 'detect';
+
+  const frameOutput = useMotionFrameOutput({ roi, phase, onScore });
 
   // Calibrating → Watching after the warm-up window (ADR-0006). M4 will
   // swap this fixed timeout for the adaptive-baseline-ready signal.
@@ -188,10 +205,12 @@ export function RecordingScreen() {
         markRecorderStarted(at);
       },
       masterUri => {
+        const final = useSessionStore.getState();
         onMasterFinished(
           masterUri,
           recordingStartedAt,
-          useSessionStore.getState().segments,
+          final.segments,
+          final.useFixedThreshold,
           finishWithSuccess,
           finishWithError,
         );
@@ -256,14 +275,59 @@ export function RecordingScreen() {
         />
       )}
       <View style={styles.topRow} pointerEvents="box-none">
-        <StateChip state={sessionState} />
+        <StateChip
+          state={sessionState}
+          fixedThreshold={useFixedThreshold}
+        />
         <MotionBars motion={motionScore} />
       </View>
+      {sessionState === 'Calibrating' && (
+        <CalibratingPanel
+          recordingStartedAt={recordingStartedAt}
+          onSkip={skipCalibration}
+        />
+      )}
       {sessionState === 'Stopping' ? (
         <StoppingPanel />
       ) : (
         <StopFab onPress={onStop} />
       )}
+    </View>
+  );
+}
+
+function CalibratingPanel({
+  recordingStartedAt,
+  onSkip,
+}: {
+  recordingStartedAt: number | null;
+  onSkip: () => void;
+}) {
+  // Tick once a second so the countdown stays roughly accurate without
+  // pinning a high-frequency render loop. Off by ≤1s, which is fine for
+  // a 15-second indicator.
+  const [, force] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => force(n => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsedMs =
+    recordingStartedAt != null ? Date.now() - recordingStartedAt : 0;
+  const remainingMs = Math.max(0, CALIBRATION_DURATION_MS - elapsedMs);
+  const remainingS = Math.ceil(remainingMs / 1000);
+  return (
+    <View style={styles.calibratingPanel} pointerEvents="box-none">
+      <Text style={styles.calibratingText}>
+        Learning what idle looks like… {remainingS}s
+      </Text>
+      <Pressable
+        style={styles.skipBtn}
+        onPress={onSkip}
+        accessibilityRole="button"
+        accessibilityLabel="Skip calibration"
+        accessibilityHint="Falls back to fixed-threshold detection (reduced accuracy)">
+        <Text style={styles.skipBtnText}>Skip calibration</Text>
+      </Pressable>
     </View>
   );
 }
@@ -311,6 +375,7 @@ async function onMasterFinished(
   masterUri: string,
   recordingStartedAt: number | null,
   segments: ActiveSegmentRecord[],
+  usedFixedThreshold: boolean,
   finishWithSuccess: (info: DoneInfo) => void,
   finishWithError: (message: string) => void,
 ) {
@@ -366,6 +431,7 @@ async function onMasterFinished(
       sessionPhotosId,
       masterPhotosId,
       segments,
+      usedFixedThreshold,
     });
   } catch (e: any) {
     const message = `splice: ${e?.message ?? e}`;
@@ -395,11 +461,18 @@ async function saveToPhotos(uri: string): Promise<string> {
   }
 }
 
-function StateChip({ state }: { state: SessionState }) {
+function StateChip({
+  state,
+  fixedThreshold,
+}: {
+  state: SessionState;
+  fixedThreshold: boolean;
+}) {
   return (
     <View style={[styles.chip, { backgroundColor: colorForState(state) }]}>
       <View style={styles.chipDot} />
       <Text style={styles.chipText}>{state}</Text>
+      {fixedThreshold && <Text style={styles.chipBadge}>fixed</Text>}
     </View>
   );
 }
@@ -518,6 +591,17 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 13,
   },
+  chipBadge: {
+    ...typography.caption,
+    color: colors.text,
+    backgroundColor: 'rgba(0, 0, 0, 0.35)',
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 1,
+    borderRadius: radii.sm,
+    marginLeft: spacing.xs,
+    fontSize: 10,
+    textTransform: 'uppercase',
+  },
   bars: { flexDirection: 'row', alignItems: 'flex-end', gap: 4 },
   bar: { width: 5, borderRadius: 2 },
   fab: {
@@ -564,5 +648,35 @@ const styles = StyleSheet.create({
   stoppingText: {
     ...typography.bodyEmphasis,
     color: colors.text,
+  },
+  calibratingPanel: {
+    position: 'absolute',
+    left: spacing.base,
+    right: spacing.base,
+    top: 116,
+    padding: spacing.md,
+    borderRadius: radii.lg,
+    backgroundColor: colors.surfacePanel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  calibratingText: {
+    ...typography.body,
+    color: colors.text,
+    fontSize: 13,
+  },
+  skipBtn: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.xs + 2,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surfaceSubtle,
+  },
+  skipBtnText: {
+    ...typography.caption,
+    color: colors.textMuted,
+    fontSize: 11,
+    textTransform: 'uppercase',
   },
 });

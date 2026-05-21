@@ -11,9 +11,10 @@
  * camera recorder — that lives in RecordingScreen, which calls the
  * transition actions below as side-effects of recorder events.
  *
- * Detection is M3 — `motionScore` is exported for the UI to consume but is
- * currently held at 0; the Watching ↔ Capturing transitions it would drive
- * are not wired in M2.
+ * Detection is M3 — `motionScore` drives the motion-bar UI and the
+ * Segmenter; M4 adds an adaptive baseline learned during Calibrating
+ * (ADR-0006) plus a "Skip Calibration" escape hatch that falls back to
+ * M3's fixed-threshold mode and is surfaced as reduced-accuracy.
  */
 
 import { create } from 'zustand';
@@ -42,6 +43,11 @@ export type DoneInfo = {
   // Master stays in the app sandbox until M5's in-app library surfaces it.
   masterPhotosId: string | null;
   segments: ActiveSegmentRecord[];
+  // True if this Session ran with the M3 fixed-threshold fallback rather
+  // than M4's adaptive baseline — surfaced on Done as a reminder that
+  // accuracy may be lower (ADR-0006). Set when the user taps Skip
+  // Calibration during the Warm-up phase.
+  usedFixedThreshold: boolean;
 };
 
 // An Active Segment as the detector emitted it. Carries diagnostics
@@ -76,6 +82,10 @@ interface SessionStore {
   masterDurationS: number | null;
 
   segments: ActiveSegmentRecord[];
+  // When true, the detector runs in the M3 fixed-threshold fallback —
+  // no per-pixel baseline, score is plain frame-to-frame Y diff.
+  // Toggled by the "Skip Calibration" button during Warm-up (ADR-0006).
+  useFixedThreshold: boolean;
 
   doneInfo: DoneInfo | null;
   error: string | null;
@@ -86,6 +96,10 @@ interface SessionStore {
 
   beginCalibration: (recordingStartedAt: number) => void;
   endCalibration: () => void;
+  // Tap-target for the in-Warm-up "Skip Calibration" button. Transitions
+  // straight to Watching and pins the detector to fixed-threshold mode
+  // for the rest of the Session (no usable baseline was learned).
+  skipCalibration: () => void;
   markRecorderStarted: (at: number) => void;
   // Segmenter callbacks: open transitions Watching → Capturing; close
   // transitions Capturing → Watching and appends to `segments`. The
@@ -110,6 +124,7 @@ const initial = {
   recorderStartedAt: null,
   masterDurationS: null,
   segments: [] as ActiveSegmentRecord[],
+  useFixedThreshold: false,
   doneInfo: null,
   error: null,
 };
@@ -129,10 +144,13 @@ export const useSessionStore = create<SessionStore>(set => ({
       masterUri: null,
       masterDurationS: null,
       segments: [],
+      useFixedThreshold: false,
       doneInfo: null,
       error: null,
     }),
   endCalibration: () => set({ sessionState: 'Watching' }),
+  skipCalibration: () =>
+    set({ sessionState: 'Watching', useFixedThreshold: true }),
   markRecorderStarted: at => set({ recorderStartedAt: at }),
   openActiveSegment: () => set({ sessionState: 'Capturing' }),
   closeActiveSegment: segment =>
