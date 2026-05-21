@@ -31,21 +31,45 @@ type SplicerNative = {
     masterPath: string,
     segments: ActiveSegment[],
   ) => Promise<SpliceResult>;
+  fileExists: (path: string) => Promise<boolean>;
+  deleteFile: (path: string) => Promise<boolean>;
 };
 
 const native = NativeModules.Splicer as SplicerNative | undefined;
 
-export async function splice(
-  masterUri: string,
-  segments: ActiveSegment[],
-): Promise<SpliceResult> {
+function requireNative(): SplicerNative {
   if (!native) {
     throw new Error(
       'Splicer native module is not linked. Rebuild the iOS app after adding Splicer.swift/SplicerBridge.mm.',
     );
   }
+  return native;
+}
+
+export async function splice(
+  masterUri: string,
+  segments: ActiveSegment[],
+): Promise<SpliceResult> {
   if (segments.length === 0) {
     throw new Error('splice() requires at least one segment');
   }
-  return native.splice(masterUri, segments);
+  return requireNative().splice(masterUri, segments);
+}
+
+/**
+ * True if a file exists at the given path or file:// URI. Used by the
+ * M5 crash-recovery sweep to confirm a persisted Master is still on
+ * disk before attempting to splice it.
+ */
+export function fileExists(path: string): Promise<boolean> {
+  return requireNative().fileExists(path);
+}
+
+/**
+ * Deletes a file. Resolves true if a file was removed, false if it
+ * was already gone. Used by the Library's "Delete Master Recording
+ * (keep Session Recording)" action.
+ */
+export function deleteFile(path: string): Promise<boolean> {
+  return requireNative().deleteFile(path);
 }

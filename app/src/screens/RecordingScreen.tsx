@@ -69,6 +69,13 @@ import {
   type MotionPhase,
 } from '../detection/motionFrameProcessor';
 import { Segmenter } from '../detection/segmenter';
+import {
+  attachMasterUri,
+  markDone,
+  markFixedThreshold,
+  markStopping,
+} from '../persistence/sessionRepo';
+import { appendSegment } from '../persistence/segmentRepo';
 
 const BAR_COUNT = 5;
 const BAR_MAX = 22;
@@ -135,7 +142,21 @@ export function RecordingScreen() {
   if (segmenterRef.current == null) {
     segmenterRef.current = new Segmenter({
       onOpen: () => openActiveSegment(),
-      onClose: (segment: ActiveSegmentRecord) => closeActiveSegment(segment),
+      onClose: (segment: ActiveSegmentRecord) => {
+        closeActiveSegment(segment);
+        // Append to DB synchronously so the row is durable before any
+        // subsequent crash. The Segmenter only emits `onClose` for
+        // already-finalized Segments, so there is no half-state to
+        // recover from later.
+        const sid = useSessionStore.getState().currentSessionId;
+        if (sid != null) {
+          try {
+            appendSegment({ sessionId: sid, segment });
+          } catch (e: any) {
+            console.warn('[RecordingScreen] appendSegment failed', e?.message ?? e);
+          }
+        }
+      },
       toMasterSeconds: (atMs: number) => {
         const origin = recorderStartedAtRef.current;
         if (origin == null) return 0;
@@ -199,6 +220,19 @@ export function RecordingScreen() {
     startRecording(
       videoOutput,
       recorderRef,
+      masterUri => {
+        // Persist the path *before* the recorder is asked to start —
+        // the file may not exist on disk yet, but the DB now knows
+        // where to look during crash recovery.
+        const sid = useSessionStore.getState().currentSessionId;
+        if (sid != null) {
+          try {
+            attachMasterUri(sid, masterUri);
+          } catch (e: any) {
+            console.warn('[RecordingScreen] attachMasterUri failed', e?.message ?? e);
+          }
+        }
+      },
       () => {
         const at = Date.now();
         recorderStartedAtRef.current = at;
@@ -208,6 +242,7 @@ export function RecordingScreen() {
         const final = useSessionStore.getState();
         onMasterFinished(
           masterUri,
+          final.currentSessionId,
           recordingStartedAt,
           final.segments,
           final.useFixedThreshold,
@@ -239,12 +274,32 @@ export function RecordingScreen() {
     segmenterRef.current?.forceClose(Date.now());
     const startedAt = recordingStartedAt ?? Date.now();
     beginStopping((Date.now() - startedAt) / 1000);
+    const sid = useSessionStore.getState().currentSessionId;
+    if (sid != null) {
+      try {
+        markStopping(sid);
+      } catch (e: any) {
+        console.warn('[RecordingScreen] markStopping failed', e?.message ?? e);
+      }
+    }
     try {
       await recorderRef.current.stopRecording();
       // Splice + Photos save runs in onMasterFinished once VisionCamera
       // hands back the Master URI.
     } catch (e: any) {
       finishWithError(`stopRecording: ${e?.message ?? e}`);
+    }
+  };
+
+  const onSkipCalibration = () => {
+    skipCalibration();
+    const sid = useSessionStore.getState().currentSessionId;
+    if (sid != null) {
+      try {
+        markFixedThreshold(sid);
+      } catch (e: any) {
+        console.warn('[RecordingScreen] markFixedThreshold failed', e?.message ?? e);
+      }
     }
   };
 
@@ -284,7 +339,7 @@ export function RecordingScreen() {
       {sessionState === 'Calibrating' && (
         <CalibratingPanel
           recordingStartedAt={recordingStartedAt}
-          onSkip={skipCalibration}
+          onSkip={onSkipCalibration}
         />
       )}
       {sessionState === 'Stopping' ? (
@@ -337,6 +392,7 @@ async function startRecording(
   recorderRef: React.MutableRefObject<Awaited<
     ReturnType<CameraVideoOutput['createRecorder']>
   > | null>,
+  onCreated: (masterUri: string) => void,
   onStarted: () => void,
   onFinish: (masterUri: string) => void,
   onError: (message: string) => void,
@@ -345,7 +401,13 @@ async function startRecording(
   try {
     recorder = await videoOutput.createRecorder({});
     recorderRef.current = recorder;
-    console.log('[RecordingScreen] recorder created, starting…');
+    // The Master file path is known at createRecorder time (VisionCamera
+    // reserves a tempURL up-front) — capture it now so M5's persistence
+    // layer can attach the URI before recording even starts. That keeps
+    // crash recovery viable for very-early crashes (the file may not
+    // yet exist; recovery's fileExists check handles that).
+    onCreated(recorder.filePath);
+    console.log('[RecordingScreen] recorder created, starting…', recorder.filePath);
   } catch (e: any) {
     console.warn('[RecordingScreen] createRecorder failed', e?.message ?? e);
     onError(`createRecorder: ${e?.message ?? e}`);
@@ -373,6 +435,7 @@ async function startRecording(
 
 async function onMasterFinished(
   masterUri: string,
+  sessionId: number | null,
   recordingStartedAt: number | null,
   segments: ActiveSegmentRecord[],
   usedFixedThreshold: boolean,
@@ -420,6 +483,17 @@ async function onMasterFinished(
       // with user-controlled retention and this branch goes away.
       if (__DEV__) {
         masterPhotosId = await saveToPhotos(masterUri);
+      }
+    }
+    if (sessionId != null) {
+      try {
+        markDone({
+          sessionId,
+          sessionUri: result.outputUri,
+          endedAtMs: Date.now(),
+        });
+      } catch (e: any) {
+        console.warn('[RecordingScreen] markDone failed', e?.message ?? e);
       }
     }
     finishWithSuccess({

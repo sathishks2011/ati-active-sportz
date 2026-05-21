@@ -31,6 +31,14 @@ export type SessionState =
 
 export type SetupStep = 1 | 2;
 
+// Top-level "screen" routing dimension orthogonal to `sessionState`.
+// The Library is a sibling destination to the Setup/Recording/Done
+// flow — it's not part of a Session's lifecycle, so it doesn't
+// belong in `sessionState`. Most of the app stays on 'session' and
+// `sessionState` decides which screen mounts; 'library' overrides
+// that to show the M5 Sessions list.
+export type AppScreen = 'session' | 'library';
+
 export type DoneInfo = {
   masterUri: string;
   masterDurationS: number;
@@ -65,6 +73,7 @@ export type ActiveSegmentRecord = {
 export const CALIBRATION_DURATION_MS = 15_000;
 
 interface SessionStore {
+  appScreen: AppScreen;
   sessionState: SessionState;
   setupStep: SetupStep;
   roi: Roi | null;
@@ -86,15 +95,21 @@ interface SessionStore {
   // no per-pixel baseline, score is plain frame-to-frame Y diff.
   // Toggled by the "Skip Calibration" button during Warm-up (ADR-0006).
   useFixedThreshold: boolean;
+  // DB primary key of the currently in-flight `sessions` row (M5,
+  // ADR-0007). Set when Setup opens a row at "Auto Record"; cleared on
+  // reset(). RecordingScreen reads it to attach the Master URI, append
+  // segments, and finalize the row.
+  currentSessionId: number | null;
 
   doneInfo: DoneInfo | null;
   error: string | null;
 
+  setAppScreen: (screen: AppScreen) => void;
   setRoi: (roi: Roi | null) => void;
   setSetupStep: (step: SetupStep) => void;
   setMotionScore: (m: number) => void;
 
-  beginCalibration: (recordingStartedAt: number) => void;
+  beginCalibration: (recordingStartedAt: number, sessionId: number) => void;
   endCalibration: () => void;
   // Tap-target for the in-Warm-up "Skip Calibration" button. Transitions
   // straight to Watching and pins the detector to fixed-threshold mode
@@ -115,6 +130,7 @@ interface SessionStore {
 }
 
 const initial = {
+  appScreen: 'session' as AppScreen,
   sessionState: 'Setup' as SessionState,
   setupStep: 1 as SetupStep,
   roi: null,
@@ -125,6 +141,7 @@ const initial = {
   masterDurationS: null,
   segments: [] as ActiveSegmentRecord[],
   useFixedThreshold: false,
+  currentSessionId: null,
   doneInfo: null,
   error: null,
 };
@@ -132,11 +149,12 @@ const initial = {
 export const useSessionStore = create<SessionStore>(set => ({
   ...initial,
 
+  setAppScreen: appScreen => set({ appScreen }),
   setRoi: roi => set({ roi }),
   setSetupStep: setupStep => set({ setupStep }),
   setMotionScore: m => set({ motionScore: Math.max(0, Math.min(1, m)) }),
 
-  beginCalibration: recordingStartedAt =>
+  beginCalibration: (recordingStartedAt, sessionId) =>
     set({
       sessionState: 'Calibrating',
       recordingStartedAt,
@@ -145,6 +163,7 @@ export const useSessionStore = create<SessionStore>(set => ({
       masterDurationS: null,
       segments: [],
       useFixedThreshold: false,
+      currentSessionId: sessionId,
       doneInfo: null,
       error: null,
     }),

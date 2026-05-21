@@ -115,4 +115,48 @@ class Splicer: NSObject {
       }
     }
   }
+
+  /// Returns whether a file exists at the given path or file:// URI. Used by
+  /// M5's crash-recovery sweep to filter persisted Sessions whose Master file
+  /// has gone missing from the caches directory.
+  @objc func fileExists(
+    _ path: String,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let url: URL = {
+      if path.hasPrefix("file://") {
+        return URL(string: path) ?? URL(fileURLWithPath: path)
+      }
+      return URL(fileURLWithPath: path)
+    }()
+    resolve(FileManager.default.fileExists(atPath: url.path))
+  }
+
+  /// Deletes the file at the given path or file:// URI. Used by the
+  /// Library's "Delete Master Recording (keep Session Recording)" action.
+  /// Resolves with `true` if a file was removed, `false` if it was already
+  /// gone. Rejects only on permission / IO errors.
+  @objc func deleteFile(
+    _ path: String,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    let url: URL = {
+      if path.hasPrefix("file://") {
+        return URL(string: path) ?? URL(fileURLWithPath: path)
+      }
+      return URL(fileURLWithPath: path)
+    }()
+    if !FileManager.default.fileExists(atPath: url.path) {
+      resolve(false)
+      return
+    }
+    do {
+      try FileManager.default.removeItem(at: url)
+      resolve(true)
+    } catch {
+      reject("E_DELETE_FAILED", "Could not delete \(url.path): \(error.localizedDescription)", error)
+    }
+  }
 }

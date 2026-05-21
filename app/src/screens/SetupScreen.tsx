@@ -30,6 +30,7 @@ import {
   type Roi,
 } from '../state/sessionMachine';
 import { colors, radii, spacing, typography } from '../design/tokens';
+import { openSession } from '../persistence/sessionRepo';
 
 // Reject accidental taps / fingernail-sized rectangles. 5% of each axis is
 // large enough to be intentional, small enough that "draw around the
@@ -48,6 +49,7 @@ function Step1() {
   const roi = useSessionStore(s => s.roi);
   const setRoi = useSessionStore(s => s.setRoi);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
+  const setAppScreen = useSessionStore(s => s.setAppScreen);
 
   const [drag, setDragState] = useState<Drag>(null);
   const dragRef = useRef<Drag>(null);
@@ -111,6 +113,13 @@ function Step1() {
           {liveRoi && <CourtRoiOverlay roi={liveRoi} />}
         </View>
       </GestureDetector>
+      <Pressable
+        style={styles.libraryLink}
+        onPress={() => setAppScreen('library')}
+        accessibilityRole="button"
+        accessibilityLabel="Open My Sessions library">
+        <Text style={styles.libraryLinkText}>My Sessions ›</Text>
+      </Pressable>
       <View style={styles.footerBar} pointerEvents="box-none">
         <Pressable
           onPress={roi ? () => setSetupStep(2) : undefined}
@@ -142,7 +151,13 @@ function Step2() {
     return null;
   }
 
-  const onConfirm = () => beginCalibration(Date.now());
+  const onConfirm = () => {
+    // Persist the Session row up-front so crash-recovery (M5) has
+    // somewhere to land if the app dies before the recorder finalizes.
+    const startedAt = Date.now();
+    const sessionId = openSession({ startedAtMs: startedAt, roi });
+    beginCalibration(startedAt, sessionId);
+  };
 
   return (
     <View style={styles.root}>
@@ -269,5 +284,21 @@ const styles = StyleSheet.create({
     ...typography.bodyEmphasis,
     color: colors.text,
     fontSize: 14,
+  },
+  libraryLink: {
+    position: 'absolute',
+    top: 60,
+    right: spacing.base,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surfacePanel,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  libraryLinkText: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 12,
   },
 });
