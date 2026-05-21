@@ -135,3 +135,42 @@ export function getSession(sessionId: number): SessionRow | null {
   if (result.rows.length === 0) return null;
   return rowToSession(result.rows[0] as Record<string, unknown>);
 }
+
+// ─── Dashboard aggregates ───────────────────────────────────────────────────
+// These are read from the Dashboard's "stats" cards. Kept synchronous —
+// each query is a single aggregate over small tables, so even with
+// hundreds of Sessions the latency is sub-millisecond.
+
+export function countDone(): number {
+  const result = getDB().executeSync(
+    `SELECT COUNT(*) AS n FROM sessions WHERE state = 'done';`,
+  );
+  return Number(result.rows[0]?.n ?? 0);
+}
+
+export function mostRecentDone(): SessionRow | null {
+  const result = getDB().executeSync(
+    `SELECT * FROM sessions
+       WHERE state = 'done'
+       ORDER BY started_at_ms DESC
+       LIMIT 1;`,
+  );
+  if (result.rows.length === 0) return null;
+  return rowToSession(result.rows[0] as Record<string, unknown>);
+}
+
+/**
+ * Sum of Active Segment durations across all `done` Sessions, in seconds.
+ * Surfaces as "active gameplay captured" on the Dashboard — the
+ * cumulative time the detector found play happening, *not* the total
+ * Session wall-clock.
+ */
+export function sumActiveSeconds(): number {
+  const result = getDB().executeSync(
+    `SELECT COALESCE(SUM(a.end_seconds - a.start_seconds), 0) AS s
+       FROM active_segments a
+       JOIN sessions sn ON sn.id = a.session_id
+       WHERE sn.state = 'done';`,
+  );
+  return Number(result.rows[0]?.s ?? 0);
+}

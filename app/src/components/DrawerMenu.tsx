@@ -43,7 +43,7 @@ type Item = {
 };
 
 const ITEMS: Item[] = [
-  { key: 'session', label: 'New Session', hint: 'Frame a court and tap Auto Record' },
+  { key: 'dashboard', label: 'Dashboard', hint: 'Home — stats and Start Recording' },
   { key: 'library', label: 'My Sessions', hint: 'Past recordings and Master retention' },
   { key: 'settings', label: 'Settings', hint: 'Detection and Warm-up preferences' },
   { key: 'about', label: 'About', hint: 'App info and roadmap' },
@@ -81,19 +81,17 @@ export function DrawerMenu({
   }, [open, drawerWidth, translateX, backdropOpacity]);
 
   const onSelect = (item: Item) => {
-    // "New Session" is the natural reset: drop the current ROI /
-    // segment buffer / done info so the user lands on Setup Step 1.
-    // Other items just pivot the appScreen — the underlying Session
-    // state is preserved so a running Session keeps recording even
-    // while the user reads About or Settings (paranoid but right —
-    // we don't want a stray tap to end a match).
-    if (item.key === 'session') {
-      // Only reset if not currently recording — interrupting a live
-      // Session via the menu would be a footgun.
+    // Dashboard is the natural reset point: if the user is sitting on
+    // a finished Done screen with stale state, jumping back home wipes
+    // the in-memory Session buffer so the next Start Recording lands
+    // on a clean Setup. We *don't* reset when a Session is actually
+    // running — interrupting a live recording via the drawer would be
+    // a footgun.
+    if (item.key === 'dashboard') {
       if (sessionState === 'Setup' || sessionState === 'Done') {
         reset();
       }
-      setAppScreen('session');
+      setAppScreen('dashboard');
     } else {
       setAppScreen(item.key);
     }
@@ -123,9 +121,7 @@ export function DrawerMenu({
         </View>
         <View style={styles.items}>
           {ITEMS.map(item => {
-            const isActive =
-              (item.key === 'session' && appScreen === 'session') ||
-              (item.key !== 'session' && appScreen === item.key);
+            const isActive = appScreen === item.key;
             return (
               <Pressable
                 key={item.key}

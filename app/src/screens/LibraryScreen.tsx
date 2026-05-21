@@ -95,7 +95,7 @@ export function LibraryScreen() {
     <View style={styles.root}>
       <View style={styles.header}>
         <Pressable
-          onPress={() => setAppScreen('session')}
+          onPress={() => setAppScreen('dashboard')}
           style={styles.backBtn}
           accessibilityRole="button"
           accessibilityLabel="Back to Setup">

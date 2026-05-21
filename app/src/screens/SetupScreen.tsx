@@ -26,7 +26,6 @@ import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { runOnJS } from 'react-native-reanimated';
 import { CameraBackdrop } from '../components/CameraBackdrop';
 import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
-import { DrawerMenu } from '../components/DrawerMenu';
 import {
   useSessionStore,
   type Roi,
@@ -57,24 +56,16 @@ type Drag = { x1: number; y1: number; x2: number; y2: number } | null;
 
 export function SetupScreen() {
   const step = useSessionStore(s => s.setupStep);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  return (
-    <View style={styles.root}>
-      {step === 1 ? (
-        <Step1 onOpenMenu={() => setDrawerOpen(true)} />
-      ) : (
-        <Step2 />
-      )}
-      <DrawerMenu open={drawerOpen} onClose={() => setDrawerOpen(false)} />
-    </View>
-  );
+  return step === 1 ? <Step1 /> : <Step2 />;
 }
 
-function Step1({ onOpenMenu }: { onOpenMenu: () => void }) {
+function Step1() {
   const { width: W, height: H } = useWindowDimensions();
   const roi = useSessionStore(s => s.roi);
   const setRoi = useSessionStore(s => s.setRoi);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
+  const setAppScreen = useSessionStore(s => s.setAppScreen);
+  const reset = useSessionStore(s => s.reset);
 
   const [drag, setDragState] = useState<Drag>(null);
   const dragRef = useRef<Drag>(null);
@@ -139,13 +130,17 @@ function Step1({ onOpenMenu }: { onOpenMenu: () => void }) {
         </View>
       </GestureDetector>
       <Pressable
-        style={styles.menuBtn}
-        onPress={onOpenMenu}
+        style={styles.homeBtn}
+        onPress={() => {
+          // Going home from Step 1 should also drop any half-drawn ROI
+          // so the next Start Recording lands clean.
+          reset();
+          setAppScreen('dashboard');
+        }}
         accessibilityRole="button"
-        accessibilityLabel="Open menu">
-        <View style={styles.menuIconBar} />
-        <View style={styles.menuIconBar} />
-        <View style={styles.menuIconBar} />
+        accessibilityLabel="Back to Dashboard">
+        <Text style={styles.homeBtnIcon}>‹</Text>
+        <Text style={styles.homeBtnLabel}>Home</Text>
       </Pressable>
       <View style={styles.footerBar} pointerEvents="box-none">
         <Pressable
@@ -353,24 +348,32 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 14,
   },
-  menuBtn: {
+  // Setup Step 1's top-left "Home" pill — replaces the M5/M7 hamburger.
+  // The drawer lives on the Dashboard now; Setup keeps a single back
+  // path out so the screen stays focused on framing the court.
+  homeBtn: {
     position: 'absolute',
     top: 60,
     left: spacing.base,
-    width: 44,
-    height: 44,
-    borderRadius: radii.md,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radii.pill,
     backgroundColor: colors.surfacePanel,
     borderWidth: 1,
     borderColor: colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 4,
   },
-  menuIconBar: {
-    width: 20,
-    height: 2,
-    borderRadius: 1,
-    backgroundColor: colors.text,
+  homeBtnIcon: {
+    ...typography.display,
+    color: colors.text,
+    fontSize: 20,
+    lineHeight: 22,
+  },
+  homeBtnLabel: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 13,
   },
 });

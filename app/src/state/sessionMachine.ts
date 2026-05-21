@@ -32,12 +32,15 @@ export type SessionState =
 export type SetupStep = 1 | 2;
 
 // Top-level "screen" routing dimension orthogonal to `sessionState`.
-// The drawer destinations are siblings to the Setup/Recording/Done
-// flow — they're not part of a Session's lifecycle, so they don't
-// belong in `sessionState`. Most of the app stays on 'session' and
-// `sessionState` decides which screen mounts; the others override
-// that to show their respective screens.
-export type AppScreen = 'session' | 'library' | 'settings' | 'about';
+// 'dashboard' is the app's home — every cold launch lands here, and
+// the user has to tap a CTA to enter the camera-capable Session flow.
+// The other destinations are siblings reachable from the drawer.
+export type AppScreen =
+  | 'dashboard'
+  | 'session'
+  | 'library'
+  | 'settings'
+  | 'about';
 
 export type DoneInfo = {
   masterUri: string;
@@ -130,7 +133,7 @@ interface SessionStore {
 }
 
 const initial = {
-  appScreen: 'session' as AppScreen,
+  appScreen: 'dashboard' as AppScreen,
   sessionState: 'Setup' as SessionState,
   setupStep: 1 as SetupStep,
   roi: null,
