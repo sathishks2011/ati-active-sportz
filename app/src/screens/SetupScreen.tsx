@@ -166,12 +166,17 @@ function Step1() {
   //      means the footer buttons live entirely outside the gesture
   //      view's bounds and the native recognizer never gets a chance
   //      to interfere with their touches.
-  // Pinch requires two fingers, so a tap on the central band still
-  // falls through to the Pressable underneath (rendered earlier so
-  // higher in the visual stack? No — rendered earlier means *behind*.
-  // The pinch View is on top in document order, with `pointerEvents`
-  // `'box-only'` so it doesn't pass touches to *its own* children, but
-  // still receives them itself for the gesture-handler bridge).
+  // Pinch lives *inside* the tap Pressable, attached via GestureDetector.
+  // Gesture-handler v2's Pinch defaults to `cancelsTouchesInView=false`,
+  // so single-finger taps still flow through to the Pressable's RN
+  // responder. Two-finger touches activate Pinch and consume from there.
+  //
+  // Why nested (not bounded sibling): a sibling GestureDetector with
+  // `pointerEvents="box-only"` was hit-testing as a topmost view in its
+  // band, stealing touches from the tap Pressable below it. Nesting
+  // means the touch system sees a single view (the Pressable) with both
+  // a gesture-handler recognizer AND an RN responder attached — they
+  // coexist because Pinch activates only on multi-touch.
   const pinchGesture = Gesture.Pinch()
     .onBegin(() => {
       'worklet';
@@ -188,35 +193,37 @@ function Step1() {
   return (
     <View style={styles.root}>
       <CameraBackdrop zoom={setupZoom} />
-      {/* Tap-to-place layer (RN Pressable; standard responder system). */}
-      <Pressable
-        style={styles.tapLayer}
-        onPress={e => onTap(e.nativeEvent.locationX, e.nativeEvent.locationY)}
-        accessibilityRole="button"
-        accessibilityLabel={
-          nextLabel
-            ? `Tap to place ${nextLabel} corner`
-            : 'All four corners placed'
-        }>
-        {liveRoi && <CourtRoiOverlay roi={liveRoi} />}
-        {pixels.map((p, i) => (
-          <CornerDot key={i} x={p.x} y={p.y} index={i + 1} />
-        ))}
-      </Pressable>
-      {/* Pinch-only gesture layer — sibling, bounded, no footer overlap. */}
+      {/* Tap-to-place + pinch-to-zoom both attach to this single layer
+          so single-finger taps work everywhere except where later
+          siblings (footer, home) sit on top. */}
       <GestureDetector gesture={pinchGesture}>
-        <View pointerEvents="box-only" style={styles.pinchLayer} />
+        <Pressable
+          style={styles.tapLayer}
+          onPress={e => onTap(e.nativeEvent.locationX, e.nativeEvent.locationY)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            nextLabel
+              ? `Tap to place ${nextLabel} corner; pinch with two fingers to zoom`
+              : 'All four corners placed; pinch with two fingers to zoom'
+          }>
+          {liveRoi && <CourtRoiOverlay roi={liveRoi} />}
+          {pixels.map((p, i) => (
+            <CornerDot key={i} x={p.x} y={p.y} index={i + 1} />
+          ))}
+        </Pressable>
       </GestureDetector>
-      <View style={styles.instructionsPanel}>
-        <Text style={styles.stepEyebrow}>Step 1 of 2</Text>
-        <Text style={styles.stepTitle}>Tap the four corners</Text>
-        <Text style={styles.stepBody}>
+      {/* Instructions overlay — `pointerEvents="box-none"` so taps
+          targeting the polygon below pass through. Compact two-line
+          format keeps the screen real estate available for placing
+          corners. */}
+      <View pointerEvents="box-none" style={styles.instructionsPanel}>
+        <Text style={styles.step1Title}>
           {nextLabel
-            ? `Tap the ${nextLabel} corner of the court.`
-            : 'All four corners placed. Tap Next to confirm.'}
+            ? `Tap the ${nextLabel} corner`
+            : 'All four corners placed'}
         </Text>
         <Text style={styles.stepHint}>
-          Pinch to zoom (two fingers). Tap Reset to start over.
+          Step 1 of 2 · pinch to zoom · Reset to restart
         </Text>
       </View>
       <View pointerEvents="none" style={styles.zoomBadge}>
@@ -531,30 +538,48 @@ function Dimmer({ roi }: { roi: Roi }) {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
+  // Step-1 instructions overlay. Compact two-line format keeps the
+  // bulk of the screen free for tap-to-place. Sits below the
+  // home/zoom row (top: 60) so it doesn't collide with either.
+  // `pointerEvents="box-none"` on the View itself lets taps over
+  // the panel pass through to the corner-placement Pressable below.
   instructionsPanel: {
     position: 'absolute',
     top: 110,
     left: spacing.base,
     right: spacing.base,
     backgroundColor: colors.surfacePanel,
-    borderRadius: radii.lg,
-    padding: spacing.md + 2,
-    gap: spacing.xs,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     borderWidth: 1,
     borderColor: colors.border,
+    alignItems: 'center',
   },
+  // Step 2 (confirm) uses the full-size heading typography; Step 1's
+  // compact pill uses the smaller step1Title below it.
   stepEyebrow: {
     ...typography.caption,
     color: colors.stateSoft.watching,
     fontWeight: '700',
   },
   stepTitle: { ...typography.heading, color: colors.text },
+  // Step-1 compact title. Sits inside the pill-shaped instructions
+  // overlay at the top of the screen, leaving the bulk of the screen
+  // available for tap-to-place.
+  step1Title: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 13,
+    textAlign: 'center',
+  },
   stepBody: { ...typography.body, color: colors.textMuted, fontSize: 13 },
   stepHint: {
     ...typography.caption,
     color: colors.textSubtle,
-    fontSize: 11,
-    marginTop: 4,
+    fontSize: 10,
+    marginTop: 2,
+    textAlign: 'center',
   },
   zoomBadge: {
     position: 'absolute',
@@ -638,26 +663,19 @@ const styles = StyleSheet.create({
     color: colors.actionStop,
     fontSize: 14,
   },
-  // Tap-to-place hit area — fills the screen behind the gesture
-  // layer. Standard RN responder system handles single-finger taps.
-  // Later siblings (footer, home, gesture layer) are rendered on top.
+  // Combined tap + pinch hit area — fills the screen. Single-finger
+  // taps go to the Pressable's onPress; two-finger touches activate
+  // the nested Pinch gesture (gesture-handler v2's
+  // `cancelsTouchesInView=false` default lets the two systems coexist).
+  // Later siblings (instructionsPanel with box-none, footer, home)
+  // render on top and receive their own taps via standard RN
+  // hit-testing.
   tapLayer: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
     bottom: 0,
-  },
-  // Pinch-to-zoom hit area — bounded so the footer (and the home
-  // button at the top) sit outside the gesture-handler view. Without
-  // this bound, the native UIGestureRecognizer eats taps that should
-  // reach the Reset / Next Pressables.
-  pinchLayer: {
-    position: 'absolute',
-    top: 200,
-    left: 0,
-    right: 0,
-    bottom: 140,
   },
   cornerDot: {
     position: 'absolute',
