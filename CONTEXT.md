@@ -33,12 +33,21 @@ The single user-facing artifact a Session produces — one continuous, dead-time
 _Avoid_: highlight, highlight reel, clip compilation, montage (these imply short-form scoring-moments-only output, which is out of MVP scope).
 
 **Active Segment**:
-A metadata-only entity describing one contiguous stretch the app classified as active play within a Session — start timestamp, end timestamp, and detection-signal scores (motion score, audio score). Active Segments **point into** the Master Recording; they are *not* separate files on disk. A typical Active Segment is **coarse**, bounded by long dead time (timeouts, between-set breaks, water breaks) and containing multiple rallies plus the short transitions between them. The Session Recording is produced by splicing the Master Recording along the Active Segment time spans, in order.
+A metadata-only entity describing one contiguous stretch the app classified as active play within a Session — start timestamp, end timestamp, and detection-signal scores (motion score, and in `'players'` Mode a player-count signal). Active Segments **point into** the Master Recording; they are *not* separate files on disk. A typical Active Segment is **coarse**, bounded by long dead time (timeouts, between-set breaks, water breaks) and containing multiple rallies plus the short transitions between them. The Session Recording is produced by splicing the Master Recording along the Active Segment time spans, in order. The open-Segment contract depends on the per-Session Detection Mode (see below): in `'motion'` Mode open requires sustained motion inside the Court ROI; in `'players'` Mode open additionally requires a minimum count of detected players inside the Court ROI ([ADR-0009](./docs/adr/0009-player-presence-gating.md)).
 _Avoid_: Clip (overloaded), segment file (Active Segments are not files), Recording (overloaded — see Session Recording / Master Recording), **Rally** (a Rally is a sport-domain concept the MVP does not model — multiple Rallies live inside one Active Segment).
 
 **Court ROI**:
-A user-drawn rectangular region within the camera's field of view that defines where motion counts as active play. Set during Session setup before "Auto Record" can be tapped, fixed for the duration of the Session, not persisted between Sessions. Motion outside the Court ROI (crowd, adjacent courts, sideline traffic) is ignored.
-_Avoid_: court boundary (an actual line on the floor — different thing), region of interest (generic CV term — be specific to this context).
+A user-defined **quadrilateral** region within the camera's field of view that defines where motion (and, in `'players'` Mode, player presence) counts as active play. The user taps the four corners of the court during Setup in order top-left → top-right → bottom-right → bottom-left ([ADR-0010](./docs/adr/0010-quadrilateral-court-roi.md)). Set during Session setup before "Auto Record" can be tapped, frozen for the duration of the Session along with the chosen pinch-zoom factor, not persisted between Sessions. Motion outside the Court ROI polygon (crowd, adjacent courts, sideline traffic) is ignored.
+_Avoid_: court boundary (an actual line on the floor — different thing), region of interest (generic CV term — be specific to this context), court rectangle (superseded — the ROI is a quadrilateral, not a rectangle).
+
+**Detection Mode**:
+The per-Session choice of how the app decides whether an Active Segment should open. Three values exist; the user picks one in Settings (or in the Setup Step 2 segmented control) before tapping Auto Record.
+- **`'motion'` Mode (UI label: "Smart")** — opens an Active Segment when motion inside the Court ROI is sustained above threshold for the leading-hold window. This is the baseline pipeline; it does not load any ML model.
+- **`'players'` Mode (UI label: "Enhanced")** — additionally requires a low-rate on-device person detector to report at least `MIN_PLAYERS_IN_ROI` people inside the Court ROI at the open-confirmation tick. Adds a TFLite person-detection model to the camera path. The close-Segment contract is unchanged in either Mode (motion-only trailing hold).
+- **`'continuous'` Mode (UI label: "Continuous")** — added 2026-05-21. Bypasses detection. No Court ROI is required at Setup, no Active Segments are emitted, and no splice runs on Stop — the Master Recording is the user-facing output, saved directly to Photos. Calibrating is skipped. Useful for general recording (non-court scenes) and for validating the recorder path without any detection in the loop.
+
+The internal identifiers (`'motion'`, `'players'`) appear in code, MMKV settings, the `sessions.detection_mode` DB column, and ADR signal-description text. The user-visible labels (`Smart`, `Enhanced`) appear only in the UI via a `labelForMode` helper. See [decisions-log: "Detection Mode names"](./docs/decisions-log.md) for the rationale behind keeping the two name registers separate.
+_Avoid_: "V1" / "V2" (engineering iteration names, not stable product vocabulary), "Basic" / "Pro" (premature tier-naming), mixing the user-visible and internal name registers in the same sentence — when describing code use `'motion'` / `'players'`, when describing UI use Smart / Enhanced.
 
 **Warm-up**:
 The opening phase of every Session (~15 seconds by default) during which the motion detector is establishing a baseline of "what idle looks like" in the current Court ROI, lighting, and gym conditions. The Master Recording captures frames during Warm-up (the encoder is always running), but **no Active Segments are emitted in the metadata during this window** — so any footage from Warm-up is automatically excluded from the final Session Recording. Users can override Warm-up with a "Skip Calibration" option that falls back to a fixed-threshold detection mode. The corresponding Session State during this phase is **Calibrating**.
@@ -107,3 +116,22 @@ If at any milestone the demo feels like "it doesn't really *do* anything yet," t
 ## Flagged ambiguities
 
 _None yet._
+
+## Field-data-gated follow-ups
+
+Three pieces of the detection stack are deliberately staged — the integration scaffolding is shipped, but the **values** behind them need real-court measurements before they're trustworthy. These are not pending features; they're knobs and a model slot waiting on evidence. If you're working on detection-related code, you almost certainly want to read these first so you don't accidentally treat the placeholder values as load-bearing.
+
+### 1. TFLite person-detector — bake-off pending
+Enhanced Mode (ADR-0009) is wired end-to-end except for the model itself. The integration shim lives in `app/src/detection/personFrameProcessor.ts` inside the `TODO(bake-off, ADR-0009)` block (~lines 80–105). Until a model is dropped in, the worklet is an intentional no-op and Enhanced Mode degrades to motion-only at runtime — that's the deliberate fallback documented in ADR-0009 ("person-detector failure behaviour").
+
+Candidates (ADR-0009 alternatives): MoveNet MultiPose Lightning, EfficientDet-Lite0, SSDLite-MobileDetV2, YOLOv8n. Decision criteria: per-frame latency on iPhone 12/13/14 via the `fast-tflite` CoreML delegate (target < 200 ms), recall on a three-gym clip set with manually-traced court polygons, and model size < 10 MB. **Pick on-device, not on paper.**
+
+Related dials in `app/src/detection/config.ts` that are also guesses pending data: `MIN_PLAYERS_IN_ROI = 3` and `PERSON_DETECTOR_HZ = 2`.
+
+### 2. IMU magnitude band — hysteresis values are guesses
+T28's handheld guardrail uses `CMDeviceMotion.userAcceleration` magnitude with a hysteresis band — currently `STABLE_THRESHOLD = 0.025` and `UNSTABLE_THRESHOLD = 0.055` (both in g's). The values live in `app/src/screens/RecordingScreen.tsx` inside the IMU polling `useEffect`.
+
+These were chosen from intuition about phone-on-stand vs phone-in-hand readings, **not** from measured traces on a parent's phone at an actual gym. Possible failure modes: a flexible camera-mount arm registering as unstable (false suppress), or a steady handheld grip registering as stable (guardrail off). Re-tune by surfacing live magnitude in the diagnostics HUD and recording traces during a real Session. See decisions-log "Known limitation — handheld false-positive" for the longer rationale.
+
+### 3. Motion-detection thresholds — tuned for a single-person room test
+`START_THRESHOLD = 0.02` and `END_THRESHOLD = 0.012` (in `app/src/detection/config.ts`) were lowered on 2026-05-21 after a single-person room-scale test showed the previous values (0.04 / 0.025) didn't trigger on a person walking past on carpet. The room test is **not** representative of a youth-volleyball court — fewer pixels change, smaller polygon coverage, single subject. Once real-court data is in hand the defaults here may want adjusting upward (real gameplay is much louder pixel-wise than one person on carpet). The values are also user-editable in Settings (T29) so the in-field tester doesn't need a rebuild to experiment; if/when the defaults are re-tuned, clear any user overrides to inherit the new values.

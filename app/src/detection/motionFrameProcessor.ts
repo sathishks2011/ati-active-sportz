@@ -31,6 +31,15 @@
  * screen-normalized ROI maps linearly to frame coords without per-frame
  * trig. The CPU cost is small at this resolution; M7 may revisit if
  * thermal headroom gets tight.
+ *
+ * Court ROI is a quadrilateral (ADR-0010). Sampling iterates the
+ * polygon's axis-aligned bounding box, then applies a point-in-quad
+ * mask (four cross-product signs) per sample. Masked-out samples do
+ * not contribute to the warm-up baseline or the per-frame diff. The
+ * mask is computed once when the per-ROI accumulator buffers are
+ * (re-)allocated — ROI is locked at Auto Record so the mask is stable
+ * for the Session. Keep the math here in sync with `state/roi.ts`'s
+ * `pointInQuad` (worklets can't import JS helpers).
  */
 
 import { useMemo, useRef } from 'react';
@@ -68,6 +77,14 @@ export function useMotionFrameOutput({
       sumCount: 0,
       // Committed baseline (frozen at the warmup→detect transition).
       baseline: null as Float32Array | null,
+      // Polygon mask: 1 if the sample at that index falls inside the
+      // user's Court ROI quadrilateral, else 0. Computed once per
+      // accumulator (re-)allocation. `maskCount` is the number of
+      // 1s in the mask — used as the score-normalization divisor so
+      // the score remains motion-per-in-court-sample regardless of
+      // how much of the frame the polygon covers.
+      mask: null as Uint8Array | null,
+      maskCount: 0,
       // Phase we last processed a frame in — used to detect the
       // warmup→detect boundary inside the worklet so the baseline
       // commit happens on the right frame.
@@ -107,10 +124,25 @@ export function useMotionFrameOutput({
         const stride = yPlane.bytesPerRow;
         const buf = new Uint8Array(yPlane.getPixelBuffer());
 
-        const x0 = Math.max(0, Math.floor(currentRoi.x * w));
-        const y0 = Math.max(0, Math.floor(currentRoi.y * h));
-        const x1 = Math.min(w, Math.floor((currentRoi.x + currentRoi.w) * w));
-        const y1 = Math.min(h, Math.floor((currentRoi.y + currentRoi.h) * h));
+        // Polygon corners in normalized coords (TL, TR, BR, BL by ADR-0010).
+        const c0x = currentRoi.corners[0][0];
+        const c0y = currentRoi.corners[0][1];
+        const c1x = currentRoi.corners[1][0];
+        const c1y = currentRoi.corners[1][1];
+        const c2x = currentRoi.corners[2][0];
+        const c2y = currentRoi.corners[2][1];
+        const c3x = currentRoi.corners[3][0];
+        const c3y = currentRoi.corners[3][1];
+
+        // Axis-aligned bounding box of the polygon, in pixel coords.
+        const minNx = Math.min(c0x, c1x, c2x, c3x);
+        const minNy = Math.min(c0y, c1y, c2y, c3y);
+        const maxNx = Math.max(c0x, c1x, c2x, c3x);
+        const maxNy = Math.max(c0y, c1y, c2y, c3y);
+        const x0 = Math.max(0, Math.floor(minNx * w));
+        const y0 = Math.max(0, Math.floor(minNy * h));
+        const x1 = Math.min(w, Math.floor(maxNx * w));
+        const y1 = Math.min(h, Math.floor(maxNy * h));
         if (x1 <= x0 || y1 <= y0) return;
 
         const cols = Math.ceil((x1 - x0) / ROI_SAMPLE_STRIDE);
@@ -128,11 +160,47 @@ export function useMotionFrameOutput({
         // Allocate / re-allocate the baseline accumulators if this is
         // our first frame or the sample count changed (shouldn't happen
         // mid-session — ROI is locked at Auto Record — but be safe).
+        // The polygon mask is computed alongside since its shape is
+        // entirely determined by the ROI corners + bounding box.
         if (state.sum == null || state.sum.length !== count) {
           state.sum = new Float32Array(count);
           state.sumCount = 0;
           state.baseline = null;
+          const mask = new Uint8Array(count);
+          let masked = 0;
+          let k = 0;
+          for (let y = y0; y < y1; y += ROI_SAMPLE_STRIDE) {
+            // Normalize this row's y once.
+            const py = h > 0 ? y / h : 0;
+            for (let x = x0; x < x1; x += ROI_SAMPLE_STRIDE) {
+              const px = w > 0 ? x / w : 0;
+              // Four cross-products against consecutive edges of the
+              // polygon. A convex polygon contains the point iff all
+              // signs agree (zeros tolerated as on-edge).
+              const s1 = (c1x - c0x) * (py - c0y) - (c1y - c0y) * (px - c0x);
+              const s2 = (c2x - c1x) * (py - c1y) - (c2y - c1y) * (px - c1x);
+              const s3 = (c3x - c2x) * (py - c2y) - (c3y - c2y) * (px - c2x);
+              const s4 = (c0x - c3x) * (py - c3y) - (c0y - c3y) * (px - c3x);
+              const allNonNeg =
+                s1 >= 0 && s2 >= 0 && s3 >= 0 && s4 >= 0;
+              const allNonPos =
+                s1 <= 0 && s2 <= 0 && s3 <= 0 && s4 <= 0;
+              if (allNonNeg || allNonPos) {
+                mask[k] = 1;
+                masked++;
+              } else {
+                mask[k] = 0;
+              }
+              k++;
+            }
+          }
+          state.mask = mask;
+          state.maskCount = masked;
         }
+        const mask = state.mask;
+        const maskCount = state.maskCount;
+        // Degenerate ROI (no in-quad samples) — skip this frame quietly.
+        if (mask == null || maskCount === 0) return;
 
         // On the warmup→detect boundary, freeze the baseline. We use
         // sum/count if Warm-up gathered enough frames; otherwise we
@@ -156,10 +224,13 @@ export function useMotionFrameOutput({
 
         // Accumulate baseline during warmup. We do this *every* frame
         // (no stride throttling here) — Warm-up is short and we want
-        // every available sample feeding the mean.
+        // every available sample feeding the mean. Only in-quad
+        // samples contribute (mask gate).
         if (currentPhase === 'warmup' && state.sum != null) {
           const sum = state.sum;
-          for (let j = 0; j < count; j++) sum[j] += samples[j];
+          for (let j = 0; j < count; j++) {
+            if (mask[j] === 1) sum[j] += samples[j];
+          }
           state.sumCount++;
         }
 
@@ -167,25 +238,30 @@ export function useMotionFrameOutput({
         //   - detect: deviation from frozen baseline.
         //   - warmup / fixed: classic frame-to-frame Y diff.
         // The segmenter is gated off during warmup by the host, so the
-        // diff value there only drives the motion-bar UI.
+        // diff value there only drives the motion-bar UI. Normalize by
+        // `maskCount` (in-quad samples) rather than `count` (bbox
+        // samples) so the score is invariant to how much of the frame
+        // the polygon happens to cover.
         let score: number | null = null;
         if (currentPhase === 'detect' && state.baseline != null) {
           const baseline = state.baseline;
           let total = 0;
           for (let j = 0; j < count; j++) {
+            if (mask[j] === 0) continue;
             const d = samples[j] - baseline[j];
             total += d < 0 ? -d : d;
           }
-          score = Math.min(1, total / count / 255);
+          score = Math.min(1, total / maskCount / 255);
         } else {
           const prev = state.prev;
           if (prev != null && prev.length === count) {
             let total = 0;
             for (let j = 0; j < count; j++) {
+              if (mask[j] === 0) continue;
               const d = samples[j] - prev[j];
               total += d < 0 ? -d : d;
             }
-            score = Math.min(1, total / count / 255);
+            score = Math.min(1, total / maskCount / 255);
           }
         }
 

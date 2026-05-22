@@ -11,6 +11,7 @@
 
 import Foundation
 import AVFoundation
+import CoreMotion
 import React
 import UIKit
 import UserNotifications
@@ -23,6 +24,17 @@ class Splicer: NSObject {
   /// we only ever run one splice at a time (single user, single Session),
   /// so the lack of an id is fine.
   private var currentExporter: AVAssetExportSession?
+
+  /// CMMotionManager for the IMU-based handheld guardrail (T28 /
+  /// decisions-log "Known limitation — handheld false-positive"). The
+  /// JS layer polls `getDeviceMotionMagnitude()` to decide whether the
+  /// phone is in hand vs on a stand and gates the Segmenter accordingly.
+  private let motionManager = CMMotionManager()
+
+  /// Magnitude of the user-induced acceleration (gravity removed),
+  /// in g's. Refreshed from `startDeviceMotionUpdates` callbacks at
+  /// `deviceMotionUpdateInterval` cadence. Read by JS at a lower rate.
+  private var latestUserAccelerationG: Double = 0.0
 
   @objc static func requiresMainQueueSetup() -> Bool {
     return false
@@ -312,5 +324,70 @@ class Splicer: NSObject {
     } catch {
       reject("E_DELETE_FAILED", "Could not delete \(url.path): \(error.localizedDescription)", error)
     }
+  }
+
+  // MARK: - Device motion (handheld guardrail, T28 / ADR-0009)
+  //
+  // Tracks the user-induced acceleration magnitude (gravity removed)
+  // via CMDeviceMotion. JS polls `getDeviceMotionMagnitude` at ~5 Hz
+  // and applies hysteresis to decide whether the phone is on a stand
+  // (stable, allow Active Segment opens) or in hand (suppress opens
+  // to avoid ego-motion false positives).
+  //
+  // The motion stream itself runs at 10 Hz on a background queue
+  // so the main thread is never blocked. `latestUserAccelerationG`
+  // is a plain Double — single writer (callback queue), single reader
+  // (JS via getDeviceMotionMagnitude), no torn reads on 64-bit
+  // architectures.
+
+  /// Begin CMDeviceMotion updates. Idempotent — calling while already
+  /// running just resolves true without restarting. Resolves false on
+  /// devices that do not have a usable IMU (mostly relevant to the
+  /// iPhone Simulator, where motion data is not available).
+  @objc func startMotionUpdates(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    guard motionManager.isDeviceMotionAvailable else {
+      resolve(false)
+      return
+    }
+    if motionManager.isDeviceMotionActive {
+      resolve(true)
+      return
+    }
+    motionManager.deviceMotionUpdateInterval = 0.1 // 10 Hz
+    let queue = OperationQueue()
+    queue.qualityOfService = .utility
+    motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
+      guard let self = self, let motion = motion else { return }
+      let ua = motion.userAcceleration
+      let mag = sqrt(ua.x * ua.x + ua.y * ua.y + ua.z * ua.z)
+      self.latestUserAccelerationG = mag
+    }
+    resolve(true)
+  }
+
+  /// Returns the most recent user-induced acceleration magnitude in
+  /// g's. Returns 0 if motion updates haven't been started yet.
+  @objc func getDeviceMotionMagnitude(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    resolve(latestUserAccelerationG)
+  }
+
+  /// Stop the CMDeviceMotion stream. Always safe to call. The stored
+  /// magnitude is reset to 0 so a subsequent restart doesn't briefly
+  /// surface a stale "moving" reading.
+  @objc func stopMotionUpdates(
+    _ resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    if motionManager.isDeviceMotionActive {
+      motionManager.stopDeviceMotionUpdates()
+    }
+    latestUserAccelerationG = 0
+    resolve(nil)
   }
 }

@@ -3,14 +3,20 @@
  *
  * Design: M0 verdict was Variant B (Guided wizard), see decisions-log.md.
  * Two steps:
- *   1. Instruction panel + drag to outline the court (normalized 0..1).
- *   2. Live-preview confirm with everything outside the ROI dimmed, so the
- *      user sees exactly what the detector will see before committing.
+ *   1. Tap the four corners of the court in TL → TR → BR → BL order
+ *      (ADR-0010). The screen guides the user through each tap with the
+ *      instruction panel and shows a numbered marker at each placed
+ *      corner; the four edges connect once enough corners exist.
+ *   2. Live-preview confirm with everything outside the ROI (approximated
+ *      by its axis-aligned bounding box; SVG masking is not available
+ *      without `react-native-svg`) dimmed, so the user sees what the
+ *      detector will see before committing.
  *
- * The ROI is committed to `sessionMachine` on drag-end; the screen reads it
- * back to render the rectangle so a re-mount (or returning from Step 2)
- * preserves the framing. ROI is *not* persisted across Sessions per
- * decisions-log — `reset()` on Done clears it.
+ * The ROI is committed to `sessionMachine` on the fourth tap (subject to
+ * convexity validation); the screen reads it back to render the polygon
+ * so a re-mount or a return from Step 2 preserves the framing. ROI is
+ * *not* persisted across Sessions per decisions-log — `reset()` on Done
+ * clears it.
  */
 
 import React, { useRef, useState } from 'react';
@@ -24,13 +30,24 @@ import {
 } from 'react-native';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { runOnJS } from 'react-native-reanimated';
-import { CameraBackdrop } from '../components/CameraBackdrop';
+import {
+  CameraBackdrop,
+  MAX_SETUP_ZOOM,
+  MIN_SETUP_ZOOM,
+} from '../components/CameraBackdrop';
 import { CourtRoiOverlay } from '../components/CourtRoiOverlay';
 import {
   useSessionStore,
   type Roi,
+  type RoiCorner,
 } from '../state/sessionMachine';
-import { useSettingsStore } from '../state/settingsStore';
+import {
+  useSettingsStore,
+  labelForMode,
+  helperTextForMode,
+} from '../state/settingsStore';
+import type { DetectionMode } from '../persistence/sessionRepo';
+import { isConvexQuad, quadBoundingBox, ROI_CORNER_LABELS } from '../state/roi';
 import { colors, radii, spacing, typography } from '../design/tokens';
 import { openSession } from '../persistence/sessionRepo';
 import { markFixedThreshold } from '../persistence/sessionRepo';
@@ -47,15 +64,20 @@ import {
 // them free space without losing prior recordings.
 const MIN_FREE_DISK_BYTES = 2 * 1024 * 1024 * 1024;
 
-// Reject accidental taps / fingernail-sized rectangles. 5% of each axis is
-// large enough to be intentional, small enough that "draw around the
-// whole frame" still works.
-const MIN_ROI_FRACTION = 0.05;
-
-type Drag = { x1: number; y1: number; x2: number; y2: number } | null;
+// Visible corner marker radius in screen pixels.
+const CORNER_DOT_RADIUS = 14;
 
 export function SetupScreen() {
   const step = useSessionStore(s => s.setupStep);
+  const mode = useSettingsStore(s => s.detectionMode);
+  // Continuous Mode (ADR-0009 amendment, decisions-log) skips the
+  // four-corner step entirely — there's no Court ROI in continuous
+  // recording. The wrapper short-circuits to Step 2 without writing
+  // back to setupStep so the user can still navigate back via
+  // `setSetupStep(1)` if they switch Mode to motion / players.
+  if (mode === 'continuous' && step === 1) {
+    return <Step2 />;
+  }
   return step === 1 ? <Step1 /> : <Step2 />;
 }
 
@@ -63,72 +85,150 @@ function Step1() {
   const { width: W, height: H } = useWindowDimensions();
   const roi = useSessionStore(s => s.roi);
   const setRoi = useSessionStore(s => s.setRoi);
+  const setupZoom = useSessionStore(s => s.setupZoom);
+  const setSetupZoom = useSessionStore(s => s.setSetupZoom);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
   const setAppScreen = useSessionStore(s => s.setAppScreen);
   const reset = useSessionStore(s => s.reset);
 
-  const [drag, setDragState] = useState<Drag>(null);
-  const dragRef = useRef<Drag>(null);
-  const setDrag = (next: Drag) => {
-    dragRef.current = next;
-    setDragState(next);
+  // Locally placed corners (0..4). Stored in *screen pixels* during
+  // Step 1 so the markers track the tap precisely; normalized only on
+  // commit. If we already have a committed ROI (returning from Step 2),
+  // seed the local state from it.
+  const [pixels, setPixels] = useState<{ x: number; y: number }[]>(() =>
+    roi
+      ? roi.corners.map(c => ({ x: c[0] * W, y: c[1] * H }))
+      : [],
+  );
+
+  // Pinch-to-zoom (decisions-log: "Pinch-to-zoom at Setup"). We track
+  // the zoom factor at the *start* of the pinch in a ref so each
+  // gesture-update tick multiplies against a stable base; the running
+  // value is committed to the session store on each tick so the
+  // CameraBackdrop re-renders with the new `zoom` prop. The Camera
+  // accepts a direct number prop on iOS; smoothness is adequate at
+  // this rate because the Camera handles interpolation internally.
+  const pinchStartZoomRef = useRef(setupZoom);
+
+  const updateZoomJS = (next: number) => {
+    const clamped = Math.max(MIN_SETUP_ZOOM, Math.min(MAX_SETUP_ZOOM, next));
+    setSetupZoom(clamped);
+  };
+  const setPinchStart = () => {
+    pinchStartZoomRef.current = setupZoom;
   };
 
-  const onBegin = (x: number, y: number) =>
-    setDrag({ x1: x, y1: y, x2: x, y2: y });
-  const onUpdate = (x: number, y: number) => {
-    const d = dragRef.current;
-    if (d) setDrag({ ...d, x2: x, y2: y });
-  };
-  const onEnd = () => {
-    const d = dragRef.current;
-    setDrag(null);
-    if (!d) return;
-    const x = Math.min(d.x1, d.x2);
-    const y = Math.min(d.y1, d.y2);
-    const w = Math.abs(d.x2 - d.x1);
-    const h = Math.abs(d.y2 - d.y1);
-    if (w / W < MIN_ROI_FRACTION || h / H < MIN_ROI_FRACTION) return;
-    setRoi({ x: x / W, y: y / H, w: w / W, h: h / H });
+  const placedCount = pixels.length;
+  const nextLabel = placedCount < 4 ? ROI_CORNER_LABELS[placedCount] : null;
+
+  const onTap = (x: number, y: number) => {
+    if (placedCount >= 4) return;
+    const next = [...pixels, { x, y }];
+    setPixels(next);
+    if (next.length === 4) {
+      const normalized = next.map(p => [p.x / W, p.y / H] as RoiCorner);
+      if (!isConvexQuad(normalized)) {
+        Alert.alert(
+          "That doesn't look like a court",
+          "The four corners need to outline a convex shape (no crossed edges). Tap Reset and try again — top-left, top-right, bottom-right, bottom-left.",
+          [{ text: 'Reset', onPress: () => setPixels([]) }],
+        );
+        return;
+      }
+      setRoi({
+        corners: [
+          normalized[0],
+          normalized[1],
+          normalized[2],
+          normalized[3],
+        ] as const,
+      });
+    } else if (roi != null) {
+      // Partial re-edit clears any previously committed ROI so Next
+      // can't sneak the user through with stale corners.
+      setRoi(null);
+    }
   };
 
-  const pan = Gesture.Pan()
-    .minDistance(2)
-    .onBegin(e => {
+  const onReset = () => {
+    setPixels([]);
+    setRoi(null);
+  };
+
+  // Pinch (two-finger) sits in a GestureDetector that's a *sibling* of
+  // the tap-to-place Pressable, not its parent. Two reasons:
+  //   1. gesture-handler's UIGestureRecognizer attaches to the
+  //      GestureDetector's child view with `cancelsTouchesInView=true`
+  //      by default — when the child is `absoluteFill` the recognizer
+  //      sees touches over the whole screen and can swallow taps that
+  //      should reach later-rendered Pressables (Reset, Next, Home).
+  //   2. Constraining the pinch hit area to the central preview band
+  //      means the footer buttons live entirely outside the gesture
+  //      view's bounds and the native recognizer never gets a chance
+  //      to interfere with their touches.
+  // Pinch lives *inside* the tap Pressable, attached via GestureDetector.
+  // Gesture-handler v2's Pinch defaults to `cancelsTouchesInView=false`,
+  // so single-finger taps still flow through to the Pressable's RN
+  // responder. Two-finger touches activate Pinch and consume from there.
+  //
+  // Why nested (not bounded sibling): a sibling GestureDetector with
+  // `pointerEvents="box-only"` was hit-testing as a topmost view in its
+  // band, stealing touches from the tap Pressable below it. Nesting
+  // means the touch system sees a single view (the Pressable) with both
+  // a gesture-handler recognizer AND an RN responder attached — they
+  // coexist because Pinch activates only on multi-touch.
+  const pinchGesture = Gesture.Pinch()
+    .onBegin(() => {
       'worklet';
-      runOnJS(onBegin)(e.x, e.y);
+      runOnJS(setPinchStart)();
     })
     .onUpdate(e => {
       'worklet';
-      runOnJS(onUpdate)(e.x, e.y);
-    })
-    .onEnd(() => {
-      'worklet';
-      runOnJS(onEnd)();
+      runOnJS(updateZoomJS)(pinchStartZoomRef.current * e.scale);
     });
 
-  const liveRoi: Roi | null = drag
-    ? {
-        x: Math.min(drag.x1, drag.x2) / W,
-        y: Math.min(drag.y1, drag.y2) / H,
-        w: Math.abs(drag.x2 - drag.x1) / W,
-        h: Math.abs(drag.y2 - drag.y1) / H,
-      }
-    : roi;
+  const liveRoi: Roi | null = roi;
+  const zoomPct = (setupZoom).toFixed(1);
 
   return (
     <View style={styles.root}>
-      <CameraBackdrop />
-      <View style={styles.instructionsPanel}>
-        <Text style={styles.stepEyebrow}>Step 1 of 2</Text>
-        <Text style={styles.stepTitle}>Frame the court</Text>
-        <Text style={styles.stepBody}>Drag to outline the playing area.</Text>
-      </View>
-      <GestureDetector gesture={pan}>
-        <View style={StyleSheet.absoluteFill}>
+      <CameraBackdrop zoom={setupZoom} />
+      {/* Tap-to-place + pinch-to-zoom both attach to this single layer
+          so single-finger taps work everywhere except where later
+          siblings (footer, home) sit on top. */}
+      <GestureDetector gesture={pinchGesture}>
+        <Pressable
+          style={styles.tapLayer}
+          onPress={e => onTap(e.nativeEvent.locationX, e.nativeEvent.locationY)}
+          accessibilityRole="button"
+          accessibilityLabel={
+            nextLabel
+              ? `Tap to place ${nextLabel} corner; pinch with two fingers to zoom`
+              : 'All four corners placed; pinch with two fingers to zoom'
+          }>
           {liveRoi && <CourtRoiOverlay roi={liveRoi} />}
-        </View>
+          {pixels.map((p, i) => (
+            <CornerDot key={i} x={p.x} y={p.y} index={i + 1} />
+          ))}
+        </Pressable>
       </GestureDetector>
+      {/* Instructions overlay — `pointerEvents="box-none"` so taps
+          targeting the polygon below pass through. Compact two-line
+          format keeps the screen real estate available for placing
+          corners. */}
+      <View pointerEvents="box-none" style={styles.instructionsPanel}>
+        <Text style={styles.step1Title}>
+          {nextLabel
+            ? `Tap the ${nextLabel} corner`
+            : 'All four corners placed'}
+        </Text>
+        <Text style={styles.stepHint}>
+          Step 1 of 2 · pinch to zoom · Reset to restart
+        </Text>
+      </View>
+      <View pointerEvents="none" style={styles.zoomBadge}>
+        <Text style={styles.zoomBadgeText}>{zoomPct}×</Text>
+      </View>
       <Pressable
         style={styles.homeBtn}
         onPress={() => {
@@ -142,7 +242,18 @@ function Step1() {
         <Text style={styles.homeBtnIcon}>‹</Text>
         <Text style={styles.homeBtnLabel}>Home</Text>
       </Pressable>
-      <View style={styles.footerBar} pointerEvents="box-none">
+      <View style={styles.footerBarSplit} pointerEvents="box-none">
+        <Pressable
+          onPress={placedCount > 0 ? onReset : undefined}
+          style={[
+            styles.resetBtn,
+            placedCount === 0 && styles.resetBtnDisabled,
+          ]}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: placedCount === 0 }}
+          accessibilityLabel="Reset corners">
+          <Text style={styles.resetBtnText}>↺  Reset</Text>
+        </Pressable>
         <Pressable
           onPress={roi ? () => setSetupStep(2) : undefined}
           style={[styles.primaryBtn, !roi && styles.primaryBtnDisabled]}
@@ -162,16 +273,92 @@ function Step1() {
   );
 }
 
+/**
+ * One pill in the Setup-screen Mode segmented control. Internal value
+ * (`'motion'` / `'players'`) goes to the setter; the visible label
+ * comes from `labelForMode` per decisions-log: "Detection Mode names".
+ */
+function ModeSegment({
+  value,
+  selected,
+  onSelect,
+}: {
+  value: DetectionMode;
+  selected: boolean;
+  onSelect: (mode: DetectionMode) => void;
+}) {
+  return (
+    <Pressable
+      onPress={() => onSelect(value)}
+      style={[
+        styles.modeSegment,
+        selected && styles.modeSegmentSelected,
+      ]}
+      accessibilityRole="radio"
+      accessibilityState={{ selected }}
+      accessibilityLabel={`${labelForMode(value)} mode`}>
+      <Text
+        style={[
+          styles.modeSegmentText,
+          selected && styles.modeSegmentTextSelected,
+        ]}>
+        {labelForMode(value)}
+      </Text>
+    </Pressable>
+  );
+}
+
+function CornerDot({
+  x,
+  y,
+  index,
+}: {
+  x: number;
+  y: number;
+  index: number;
+}) {
+  return (
+    <View
+      pointerEvents="none"
+      style={[
+        styles.cornerDot,
+        {
+          left: x - CORNER_DOT_RADIUS,
+          top: y - CORNER_DOT_RADIUS,
+        },
+      ]}>
+      <Text style={styles.cornerDotLabel}>{index}</Text>
+    </View>
+  );
+}
+
 function Step2() {
   const roi = useSessionStore(s => s.roi);
+  const setupZoom = useSessionStore(s => s.setupZoom);
   const setSetupStep = useSessionStore(s => s.setSetupStep);
   const beginCalibration = useSessionStore(s => s.beginCalibration);
   const skipCalibration = useSessionStore(s => s.skipCalibration);
   const alwaysSkipWarmup = useSettingsStore(s => s.alwaysSkipWarmup);
+  const detectionMode = useSettingsStore(s => s.detectionMode);
+  const setDetectionMode = useSettingsStore(s => s.setDetectionMode);
 
-  // Step 2 is unreachable without a valid ROI (Next is disabled in Step 1),
-  // but the type system doesn't know that — short-circuit defensively.
-  if (!roi) {
+  const isContinuous = detectionMode === 'continuous';
+
+  // Switching from Continuous to a detection mode while in Step 2 needs
+  // to drop the user back to Step 1 so they can draw the polygon. The
+  // segmented control routes through this so the redirect happens at
+  // the source of the change.
+  const onSwitchMode = (next: DetectionMode) => {
+    setDetectionMode(next);
+    if (next !== 'continuous' && roi == null) {
+      setSetupStep(1);
+    }
+  };
+
+  // Non-continuous modes need a committed ROI. Step 1's Next button
+  // gates on this, but defensively short-circuit here too. Continuous
+  // mode skips the polygon entirely so a null `roi` is expected.
+  if (!isContinuous && !roi) {
     return null;
   }
 
@@ -205,14 +392,27 @@ function Step2() {
 
     // Persist the Session row up-front so crash-recovery (M5) has
     // somewhere to land if the app dies before the recorder finalizes.
+    // `setupZoom` is the value the user landed on via pinch-to-zoom in
+    // Step 1 (decisions-log: "Pinch-to-zoom at Setup") — frozen here
+    // and re-applied as the Camera `zoom` prop on the RecordingScreen
+    // so the worklet sees exactly the framing the user chose.
     const startedAt = Date.now();
-    const sessionId = openSession({ startedAtMs: startedAt, roi });
+    const sessionId = openSession({
+      startedAtMs: startedAt,
+      roi,
+      setupZoom,
+      detectionMode,
+    });
     beginCalibration(startedAt, sessionId);
-    if (alwaysSkipWarmup) {
-      // Honour the Settings opt-out — the user has told us they
-      // routinely arrive mid-match, so the baseline can't learn a
-      // clean idle court. Flip straight into Watching with the
-      // fixed-threshold detector and mirror the choice to DB.
+    // Continuous mode has no detector → no baseline to learn → skip
+    // Calibrating entirely. The user goes straight to the recording
+    // view without the 15s warm-up screen.
+    if (isContinuous || alwaysSkipWarmup) {
+      // Honour the Settings opt-out (or the lack of a detector in
+      // Continuous mode) — flip straight into Watching with the
+      // fixed-threshold detector and mirror the choice to DB. For
+      // Continuous mode the fixed-threshold flag is cosmetic since
+      // no detection runs anyway.
       skipCalibration();
       try {
         markFixedThreshold(sessionId);
@@ -224,24 +424,68 @@ function Step2() {
 
   return (
     <View style={styles.root}>
-      <CameraBackdrop />
-      <Dimmer roi={roi} />
-      <CourtRoiOverlay roi={roi} />
+      <CameraBackdrop zoom={setupZoom} />
+      {/* Dim + polygon overlay only when a polygon exists (i.e., not
+          Continuous mode). Continuous mode shows the live preview clean. */}
+      {!isContinuous && roi && <Dimmer roi={roi} />}
+      {!isContinuous && roi && <CourtRoiOverlay roi={roi} />}
       <View style={styles.instructionsPanel}>
-        <Text style={styles.stepEyebrow}>Step 2 of 2</Text>
-        <Text style={styles.stepTitle}>Confirm the framing</Text>
-        <Text style={styles.stepBody}>
-          The dimmed area is what will be ignored.
+        <Text style={styles.stepEyebrow}>
+          {isContinuous ? 'Ready to record' : 'Step 2 of 2'}
         </Text>
+        <Text style={styles.stepTitle}>
+          {isContinuous ? 'Continuous recording' : 'Confirm the framing'}
+        </Text>
+        <Text style={styles.stepBody}>
+          {isContinuous
+            ? 'No detection. The whole recording is saved to Photos as-is.'
+            : 'The dimmed area is what will be ignored.'}
+        </Text>
+        <View style={styles.modePickerRow}>
+          <Text style={styles.modeChipLabel}>Mode</Text>
+          <View style={styles.modeSegmentedControl}>
+            <ModeSegment
+              value="motion"
+              selected={detectionMode === 'motion'}
+              onSelect={onSwitchMode}
+            />
+            <ModeSegment
+              value="players"
+              selected={detectionMode === 'players'}
+              onSelect={onSwitchMode}
+            />
+            <ModeSegment
+              value="continuous"
+              selected={detectionMode === 'continuous'}
+              onSelect={onSwitchMode}
+            />
+          </View>
+        </View>
+        <Text style={styles.modeHelper}>
+          {helperTextForMode(detectionMode)}
+        </Text>
+        <View style={styles.modeChipRow}>
+          <Text style={styles.modeChipLabel}>Zoom</Text>
+          <View style={styles.modeChip}>
+            <Text style={styles.modeChipValue}>{setupZoom.toFixed(1)}×</Text>
+          </View>
+        </View>
       </View>
       <View style={styles.footerBarSplit} pointerEvents="box-none">
-        <Pressable
-          onPress={() => setSetupStep(1)}
-          style={styles.backBtn}
-          accessibilityRole="button"
-          accessibilityLabel="Edit framing">
-          <Text style={styles.backBtnText}>‹  Edit</Text>
-        </Pressable>
+        {!isContinuous ? (
+          <Pressable
+            onPress={() => setSetupStep(1)}
+            style={styles.backBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Edit framing">
+            <Text style={styles.backBtnText}>‹  Edit</Text>
+          </Pressable>
+        ) : (
+          // Continuous mode has nothing to edit (no polygon). Render
+          // an empty spacer so the Auto Record button stays anchored
+          // to the right edge of the split footer.
+          <View />
+        )}
         <Pressable
           style={styles.primaryBtn}
           onPress={onConfirm}
@@ -254,12 +498,22 @@ function Step2() {
   );
 }
 
+/**
+ * Step-2 dim affordance. We dim the four rectangular strips outside the
+ * polygon's axis-aligned bounding box rather than the precise outside-of-
+ * polygon region — proper polygon masking would need `react-native-svg`
+ * or a Skia surface, neither of which is currently a dependency. The
+ * approximation still gives the user a clear "this is what we're
+ * looking at" affordance; the polygon stroke from CourtRoiOverlay sits
+ * on top and tells the precise story.
+ */
 function Dimmer({ roi }: { roi: Roi }) {
   const { width: W, height: H } = useWindowDimensions();
-  const left = roi.x * W;
-  const top = roi.y * H;
-  const right = left + roi.w * W;
-  const bottom = top + roi.h * H;
+  const bbox = quadBoundingBox(roi);
+  const left = bbox.x * W;
+  const top = bbox.y * H;
+  const right = left + bbox.w * W;
+  const bottom = top + bbox.h * H;
   return (
     <View pointerEvents="none" style={StyleSheet.absoluteFill}>
       <View style={[styles.dim, styles.dimTopRow, { height: top }]} />
@@ -284,25 +538,67 @@ function Dimmer({ roi }: { roi: Roi }) {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
+  // Step-1 instructions overlay. Compact two-line format keeps the
+  // bulk of the screen free for tap-to-place. Sits below the
+  // home/zoom row (top: 60) so it doesn't collide with either.
+  // `pointerEvents="box-none"` on the View itself lets taps over
+  // the panel pass through to the corner-placement Pressable below.
   instructionsPanel: {
     position: 'absolute',
     top: 110,
     left: spacing.base,
     right: spacing.base,
     backgroundColor: colors.surfacePanel,
-    borderRadius: radii.lg,
-    padding: spacing.md + 2,
-    gap: spacing.xs,
+    borderRadius: radii.pill,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
     borderWidth: 1,
     borderColor: colors.border,
+    alignItems: 'center',
   },
+  // Step 2 (confirm) uses the full-size heading typography; Step 1's
+  // compact pill uses the smaller step1Title below it.
   stepEyebrow: {
     ...typography.caption,
     color: colors.stateSoft.watching,
     fontWeight: '700',
   },
   stepTitle: { ...typography.heading, color: colors.text },
+  // Step-1 compact title. Sits inside the pill-shaped instructions
+  // overlay at the top of the screen, leaving the bulk of the screen
+  // available for tap-to-place.
+  step1Title: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 13,
+    textAlign: 'center',
+  },
   stepBody: { ...typography.body, color: colors.textMuted, fontSize: 13 },
+  stepHint: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 10,
+    marginTop: 2,
+    textAlign: 'center',
+  },
+  zoomBadge: {
+    position: 'absolute',
+    top: 60,
+    right: spacing.base,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surfacePanel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    minWidth: 56,
+    alignItems: 'center',
+  },
+  zoomBadgeText: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 13,
+  },
   dim: { position: 'absolute', backgroundColor: colors.dimMask },
   dimTopRow: { left: 0, right: 0, top: 0 },
   dimBottomRow: { left: 0, right: 0, bottom: 0 },
@@ -343,10 +639,118 @@ const styles = StyleSheet.create({
     borderRadius: radii.pill,
     backgroundColor: colors.surfaceSubtle,
   },
+  backBtnDisabled: { opacity: 0.4 },
   backBtnText: {
     ...typography.bodyEmphasis,
     color: colors.text,
     fontSize: 14,
+  },
+  // Visually prominent Reset for Step 1 — warm-tone outlined pill so
+  // it stands out from the surfaceSubtle "back/edit" pattern used
+  // elsewhere. Reset is the only way out of a stuck-corner state, so
+  // it earns its own visual weight.
+  resetBtn: {
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surface,
+    borderWidth: 2,
+    borderColor: colors.actionStop,
+  },
+  resetBtnDisabled: { opacity: 0.35 },
+  resetBtnText: {
+    ...typography.bodyEmphasis,
+    color: colors.actionStop,
+    fontSize: 14,
+  },
+  // Combined tap + pinch hit area — fills the screen. Single-finger
+  // taps go to the Pressable's onPress; two-finger touches activate
+  // the nested Pinch gesture (gesture-handler v2's
+  // `cancelsTouchesInView=false` default lets the two systems coexist).
+  // Later siblings (instructionsPanel with box-none, footer, home)
+  // render on top and receive their own taps via standard RN
+  // hit-testing.
+  tapLayer: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+  },
+  cornerDot: {
+    position: 'absolute',
+    width: CORNER_DOT_RADIUS * 2,
+    height: CORNER_DOT_RADIUS * 2,
+    borderRadius: CORNER_DOT_RADIUS,
+    backgroundColor: colors.roiStroke,
+    borderWidth: 2,
+    borderColor: colors.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cornerDotLabel: {
+    ...typography.bodyEmphasis,
+    color: colors.bg,
+    fontSize: 12,
+    lineHeight: 14,
+  },
+  modeChipRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  modeChipLabel: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontWeight: '700',
+  },
+  modeChip: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 4,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surfaceSubtle,
+  },
+  modeChipValue: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 12,
+  },
+  modePickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  modeSegmentedControl: {
+    flexDirection: 'row',
+    backgroundColor: colors.surfaceSubtle,
+    borderRadius: radii.pill,
+    padding: 2,
+    gap: 2,
+  },
+  modeSegment: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm - 2,
+    borderRadius: radii.pill,
+  },
+  modeSegmentSelected: {
+    backgroundColor: colors.actionStart,
+  },
+  modeSegmentText: {
+    ...typography.bodyEmphasis,
+    color: colors.textMuted,
+    fontSize: 12,
+  },
+  modeSegmentTextSelected: {
+    color: colors.actionText,
+  },
+  modeHelper: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 11,
+    lineHeight: 14,
+    marginTop: 4,
   },
   // Setup Step 1's top-left "Home" pill — replaces the M5/M7 hamburger.
   // The drawer lives on the Dashboard now; Setup keeps a single back

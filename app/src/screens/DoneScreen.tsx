@@ -37,13 +37,33 @@ export function DoneScreen() {
   const error = useSessionStore(s => s.error);
   const reset = useSessionStore(s => s.reset);
 
+  // Three landing states for Done:
+  //   1. Clean success — doneInfo with sessionUri set, no recoveryNote.
+  //      "Saved to Photos".
+  //   2. Recovered Session — doneInfo present, *either* recoveryNote
+  //      set or sessionUri null. The Master Recording was preserved
+  //      even though something went wrong (recorder error / splice
+  //      failure / no motion). Title makes that obvious.
+  //   3. Hard error — no doneInfo, just `error`. Master file was
+  //      missing or never created. Render the message we have.
+  const isRecovered =
+    doneInfo != null &&
+    (doneInfo.recoveryNote != null || doneInfo.sessionUri == null);
+  const title =
+    doneInfo == null
+      ? 'Finished with an error'
+      : isRecovered
+        ? 'Master preserved'
+        : 'Saved to Photos';
+
   return (
     <View style={styles.root}>
       <View style={styles.panel}>
         <Text style={styles.eyebrow}>Session</Text>
-        <Text style={styles.title}>
-          {doneInfo ? 'Saved to Photos' : 'Finished with an error'}
-        </Text>
+        <Text style={styles.title}>{title}</Text>
+        {doneInfo?.recoveryNote && (
+          <Text style={styles.recoveryText}>{doneInfo.recoveryNote}</Text>
+        )}
         {error && <Text style={styles.errorText}>{error}</Text>}
         {doneInfo && <DoneStats info={doneInfo} />}
         <Pressable
@@ -79,7 +99,7 @@ function DoneStats({ info }: { info: DoneInfo }) {
         <Row k="Master in Photos (dev)" v={info.masterPhotosId} mono />
       )}
       <Row k="Master URI" v={info.masterUri} mono small />
-      <Row k="Session URI" v={info.sessionUri} mono small />
+      <Row k="Session URI" v={info.sessionUri ?? '(none — Master only)'} mono small />
     </ScrollView>
   );
 }
@@ -135,6 +155,15 @@ const styles = StyleSheet.create({
     ...typography.body,
     color: colors.stateSoft.capturing,
     fontSize: 13,
+  },
+  recoveryText: {
+    ...typography.body,
+    color: colors.stateSoft.calibrating,
+    fontSize: 13,
+    lineHeight: 18,
+    backgroundColor: colors.surfaceSubtle,
+    borderRadius: radii.md,
+    padding: spacing.md,
   },
   stats: { maxHeight: 320 },
   row: {
