@@ -100,4 +100,35 @@ function migrate(db: DB) {
       db.executeSync('UPDATE schema_version SET version = 1;');
     }
   }
+
+  // v2 — ADR-0010 (Court ROI is a quadrilateral, not a rectangle) plus the
+  // Setup-frozen zoom factor (decisions-log: "Pinch-to-zoom at Setup") and
+  // ADR-0009's per-Session detection_mode.
+  //
+  // SQLite 3.35+ supports ALTER TABLE DROP COLUMN, and op-sqlite ships a
+  // modern build, so we use ADD/UPDATE/DROP rather than the rebuild dance.
+  // Legacy rect rows are backfilled by composing the four corners
+  // TL → TR → BR → BL from (roi_x, roi_y, roi_w, roi_h).
+  if (currentVersion < 2) {
+    db.executeSync(`ALTER TABLE sessions ADD COLUMN roi_corners TEXT;`);
+    db.executeSync(
+      `ALTER TABLE sessions ADD COLUMN setup_zoom REAL NOT NULL DEFAULT 1.0;`,
+    );
+    db.executeSync(
+      `ALTER TABLE sessions ADD COLUMN detection_mode TEXT NOT NULL DEFAULT 'motion';`,
+    );
+    db.executeSync(`
+      UPDATE sessions
+         SET roi_corners = '[[' || roi_x || ',' || roi_y || '],['
+                                || (roi_x + roi_w) || ',' || roi_y || '],['
+                                || (roi_x + roi_w) || ',' || (roi_y + roi_h) || '],['
+                                || roi_x || ',' || (roi_y + roi_h) || ']]'
+       WHERE roi_corners IS NULL;
+    `);
+    db.executeSync(`ALTER TABLE sessions DROP COLUMN roi_x;`);
+    db.executeSync(`ALTER TABLE sessions DROP COLUMN roi_y;`);
+    db.executeSync(`ALTER TABLE sessions DROP COLUMN roi_w;`);
+    db.executeSync(`ALTER TABLE sessions DROP COLUMN roi_h;`);
+    db.executeSync('UPDATE schema_version SET version = 2;');
+  }
 }

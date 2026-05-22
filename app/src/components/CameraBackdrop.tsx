@@ -15,7 +15,19 @@ import React, { useMemo } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Camera, useCameraDevices } from 'react-native-vision-camera';
 
-export function CameraBackdrop() {
+/**
+ * Lower / upper clamp on the pinch-to-zoom factor. Devices report their
+ * own min/max via `device.minZoom` and `device.maxZoom`, but binding
+ * those into Setup would require plumbing the device object through to
+ * the gesture state. For the MVP we clamp 1.0..5.0 — covers the
+ * range a parent would reasonably need from the stands without ever
+ * exceeding the wide-angle camera's optical bounds on iPhones we
+ * target. A device-aware clamp is a follow-up.
+ */
+export const MIN_SETUP_ZOOM = 1;
+export const MAX_SETUP_ZOOM = 5;
+
+export function CameraBackdrop({ zoom }: { zoom?: number } = {}) {
   const devices = useCameraDevices();
   const device = useMemo(
     () =>
@@ -33,7 +45,14 @@ export function CameraBackdrop() {
       </View>
     );
   }
-  return <Camera style={StyleSheet.absoluteFill} device={device} isActive />;
+  return (
+    <Camera
+      style={StyleSheet.absoluteFill}
+      device={device}
+      isActive
+      zoom={zoom}
+    />
+  );
 }
 
 const styles = StyleSheet.create({

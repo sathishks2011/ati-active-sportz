@@ -40,6 +40,7 @@ import {
   Camera,
   CommonResolutions,
   useCameraDevices,
+  usePhotoOutput,
   useVideoOutput,
   type CameraVideoOutput,
 } from 'react-native-vision-camera';
@@ -48,11 +49,15 @@ import {
   iosRequestAddOnlyGalleryPermission,
 } from '@react-native-camera-roll/camera-roll';
 import {
+  fileExists,
+  getDeviceMotionMagnitude,
   getSpliceProgress,
   getThermalState,
   scheduleLocalNotification,
   setIdleTimerDisabled,
   splice,
+  startMotionUpdates,
+  stopMotionUpdates,
   type ActiveSegment,
   type ThermalState,
 } from '../native/Splicer';
@@ -77,14 +82,25 @@ import {
   useMotionFrameOutput,
   type MotionPhase,
 } from '../detection/motionFrameProcessor';
+import { usePersonFrameOutput } from '../detection/personFrameProcessor';
 import { Segmenter } from '../detection/segmenter';
+import {
+  END_THRESHOLD,
+  START_THRESHOLD,
+} from '../detection/config';
 import {
   attachMasterUri,
   markDone,
+  markDoneRecovered,
   markFixedThreshold,
   markStopping,
 } from '../persistence/sessionRepo';
 import { appendSegment } from '../persistence/segmentRepo';
+import {
+  useSettingsStore,
+  labelForMode,
+  effectiveThresholds,
+} from '../state/settingsStore';
 
 const BAR_COUNT = 5;
 const BAR_MAX = 22;
@@ -107,9 +123,34 @@ export function RecordingScreen() {
     enableAudio: false,
   });
 
+  // Photo output for the in-app Snapshot button. iOS AVCaptureSession
+  // supports photo + video outputs simultaneously, so this coexists
+  // with the recorder. Quality 'balanced' keeps capture latency low
+  // (full 'quality' triggers HDR multi-frame fusion which can hitch
+  // the recording for a frame or two). Mounted unconditionally — the
+  // Snapshot button is the only thing that drives it; we pay no cost
+  // when it isn't pressed.
+  const photoOutput = usePhotoOutput({
+    qualityPrioritization: 'balanced',
+  });
+
+  // Snapshot UX state: a brief check-flash after a successful save so
+  // the user knows the still landed in Photos without having to leave
+  // the Recording screen. Auto-clears after a beat.
+  const [snapshotFlash, setSnapshotFlash] = useState<
+    'idle' | 'saving' | 'saved' | 'error'
+  >('idle');
+
   const sessionState = useSessionStore(s => s.sessionState);
   const recordingStartedAt = useSessionStore(s => s.recordingStartedAt);
   const roi = useSessionStore(s => s.roi);
+  // Setup-frozen pinch-zoom factor (decisions-log: "Pinch-to-zoom at
+  // Setup"). Applied to the Camera so the Frame Processor sees the
+  // same framing the user chose during Setup. Reads the live store
+  // value — `reset()` restores it to 1, and SetupScreen doesn't touch
+  // it after Auto Record, so the value is effectively frozen for the
+  // Session without needing a separate snapshot.
+  const setupZoom = useSessionStore(s => s.setupZoom);
   const motionScore = useSessionStore(s => s.motionScore);
   const setMotionScore = useSessionStore(s => s.setMotionScore);
   const useFixedThreshold = useSessionStore(s => s.useFixedThreshold);
@@ -154,36 +195,77 @@ export function RecordingScreen() {
   // store actions / ref via closure.
   const segmenterRef = useRef<Segmenter | null>(null);
   if (segmenterRef.current == null) {
-    segmenterRef.current = new Segmenter({
-      onOpen: () => openActiveSegment(),
-      onClose: (segment: ActiveSegmentRecord) => {
-        closeActiveSegment(segment);
-        // Append to DB synchronously so the row is durable before any
-        // subsequent crash. The Segmenter only emits `onClose` for
-        // already-finalized Segments, so there is no half-state to
-        // recover from later.
-        const sid = useSessionStore.getState().currentSessionId;
-        if (sid != null) {
-          try {
-            appendSegment({ sessionId: sid, segment });
-          } catch (e: any) {
-            console.warn('[RecordingScreen] appendSegment failed', e?.message ?? e);
+    // Resolve user-overridden thresholds at construction so they're
+    // captured for the Session's lifetime. Settings changes mid-Session
+    // intentionally don't reach the Segmenter — keeps the trigger
+    // contract stable per Session (ADR-0009).
+    const thresholds = effectiveThresholds(useSettingsStore.getState());
+    segmenterRef.current = new Segmenter(
+      {
+        onOpen: () => openActiveSegment(),
+        onClose: (segment: ActiveSegmentRecord) => {
+          closeActiveSegment(segment);
+          // Append to DB synchronously so the row is durable before any
+          // subsequent crash. The Segmenter only emits `onClose` for
+          // already-finalized Segments, so there is no half-state to
+          // recover from later.
+          const sid = useSessionStore.getState().currentSessionId;
+          if (sid != null) {
+            try {
+              appendSegment({ sessionId: sid, segment });
+            } catch (e: any) {
+              console.warn('[RecordingScreen] appendSegment failed', e?.message ?? e);
+            }
           }
-        }
+        },
+        toMasterSeconds: (atMs: number) => {
+          const origin = recorderStartedAtRef.current;
+          if (origin == null) return 0;
+          return Math.max(0, (atMs - origin) / 1000);
+        },
       },
-      toMasterSeconds: (atMs: number) => {
-        const origin = recorderStartedAtRef.current;
-        if (origin == null) return 0;
-        return Math.max(0, (atMs - origin) / 1000);
-      },
-    });
+      thresholds,
+    );
   }
+
+  // Detection Mode is locked at Auto Record (read from Settings; the
+  // Session row was already stamped with this value in SetupScreen). We
+  // capture it once here per Session via `useRef`-of-snapshot so a user
+  // flipping the Settings toggle mid-Session does not change the
+  // pipeline mid-Session (ADR-0009).
+  const detectionMode = useSettingsStore(s => s.detectionMode);
+  const sessionModeRef = useRef(detectionMode);
+  useEffect(() => {
+    // Refresh only while the Session has not started yet; once we're
+    // recording, freeze the value.
+    if (sessionState === 'Setup') {
+      sessionModeRef.current = detectionMode;
+    }
+  }, [detectionMode, sessionState]);
+  const isPlayersMode = sessionModeRef.current === 'players';
 
   // The Frame Processor's per-frame onScore runs on JS (via runOnJS).
   // We update the motion-bar UI and feed the Segmenter — both cheap.
   const onScore = (score: number, atMs: number) => {
     setMotionScore(score);
     segmenterRef.current?.onScore(score, atMs);
+  };
+
+  // Latest person count from the person-detector worklet (Enhanced
+  // Mode only). Mirrored from the Segmenter's internal counter so the
+  // dev diagnostics HUD can render it without exposing private state.
+  const [lastPersonCount, setLastPersonCount] = useState<number | null>(
+    null,
+  );
+
+  // The person-detector worklet's tick (when 'players' Mode is active).
+  // Just keeps the Segmenter's latest person-count fresh; the gate is
+  // checked at open-confirmation time. In 'motion' Mode this is never
+  // called and `lastPersonCount` stays null inside the Segmenter,
+  // collapsing the player gate to "always open".
+  const onPersonCount = (count: number, _atMs: number) => {
+    segmenterRef.current?.setPersonCount(count);
+    setLastPersonCount(count);
   };
 
   // Detection phase (ADR-0006 / M4):
@@ -199,6 +281,15 @@ export function RecordingScreen() {
       : 'detect';
 
   const frameOutput = useMotionFrameOutput({ roi, phase, onScore });
+  // Mount the person-detector worklet only when Mode = 'players'. Hooks
+  // must be called unconditionally, so we always call the hook and rely
+  // on conditional inclusion in the Camera's `outputs` array below.
+  // Passing `roi: null` when the mode is 'motion' makes the worklet a
+  // no-op — its onFrame returns immediately.
+  const personFrameOutput = usePersonFrameOutput({
+    roi: isPlayersMode ? roi : null,
+    onPersonCount,
+  });
 
   // Calibrating → Watching after the warm-up window (ADR-0006). M4 will
   // swap this fixed timeout for the adaptive-baseline-ready signal.
@@ -262,9 +353,47 @@ export function RecordingScreen() {
           final.useFixedThreshold,
           finishWithSuccess,
           finishWithError,
+          null, // recoveryReason — clean finish
+          sessionModeRef.current === 'continuous',
         );
       },
-      finishWithError,
+      // Recorder-error recovery path. AVFoundation often reports
+      // `AVErrorRecordingSuccessfullyFinishedKey=true` on -11818 under
+      // thermal pressure or screenshot interruptions — the Master file
+      // is finalized on disk even though the SDK surfaces an error. If
+      // we have a path, route through onMasterFinished with a recovery
+      // note so the splice + Photos save still runs. If the file is
+      // missing or recorderRef has no path yet (early failure), surface
+      // a hard error via finishWithError.
+      (message: string) => {
+        const path = recorderRef.current?.filePath ?? null;
+        const final = useSessionStore.getState();
+        if (path == null) {
+          finishWithError(message);
+          return;
+        }
+        const recoveryReason =
+          'The recorder ended unexpectedly (likely thermal pressure or a screenshot interrupting AVFoundation). Your recording was preserved up to that point.';
+        // Make sure any open Segment is flushed so partial play isn't
+        // lost from the splice when we recover from an unexpected stop.
+        segmenterRef.current?.forceClose(Date.now());
+        const segmentsAtError = useSessionStore.getState().segments;
+        console.warn(
+          '[RecordingScreen] recovering Master after recorder error',
+          { path, segments: segmentsAtError.length, message },
+        );
+        onMasterFinished(
+          path,
+          final.currentSessionId,
+          recordingStartedAt,
+          segmentsAtError,
+          final.useFixedThreshold,
+          finishWithSuccess,
+          finishWithError,
+          `${recoveryReason} (Underlying error: ${message})`,
+          sessionModeRef.current === 'continuous',
+        );
+      },
     );
   }, [
     device,
@@ -314,6 +443,43 @@ export function RecordingScreen() {
       } catch (e: any) {
         console.warn('[RecordingScreen] markFixedThreshold failed', e?.message ?? e);
       }
+    }
+  };
+
+  // In-app frame snapshot. Avoids iOS screenshot mid-Session (which has
+  // correlated with AVFoundation -11818 errors under thermal pressure)
+  // and writes the captured still to Photos so the user can share it
+  // without leaving the recording flow.
+  //
+  // Pipeline: photoOutput.capturePhoto → saveToTemporaryFileAsync
+  // returns a filesystem path → CameraRoll.saveAsset under the photo
+  // type → photo.dispose() releases native buffers. The recorder
+  // continues uninterrupted (AVCaptureSession supports photo + video
+  // outputs simultaneously on iOS).
+  const onSnapshot = async () => {
+    if (snapshotFlash === 'saving') return;
+    setSnapshotFlash('saving');
+    let photo: Awaited<ReturnType<typeof photoOutput.capturePhoto>> | null =
+      null;
+    try {
+      const perm = await iosRequestAddOnlyGalleryPermission();
+      if (perm !== 'granted' && perm !== 'limited') {
+        console.warn('[RecordingScreen] snapshot: photos permission', perm);
+        setSnapshotFlash('error');
+        setTimeout(() => setSnapshotFlash('idle'), 1500);
+        return;
+      }
+      photo = await photoOutput.capturePhoto({}, {});
+      const filesystemPath = await photo.saveToTemporaryFileAsync();
+      await CameraRoll.saveAsset(`file://${filesystemPath}`, { type: 'photo' });
+      setSnapshotFlash('saved');
+      setTimeout(() => setSnapshotFlash('idle'), 1200);
+    } catch (e: any) {
+      console.warn('[RecordingScreen] snapshot failed', e?.message ?? e);
+      setSnapshotFlash('error');
+      setTimeout(() => setSnapshotFlash('idle'), 1500);
+    } finally {
+      photo?.dispose();
     }
   };
 
@@ -400,14 +566,73 @@ export function RecordingScreen() {
     };
   }, []);
 
+  // Handheld guardrail (T28 / ADR-0009 / decisions-log "Known
+  // limitation — handheld false-positive"). Poll the CMDeviceMotion
+  // magnitude every 200ms, apply hysteresis around a 0.04 g band
+  // (stable < 0.025, unstable > 0.055 — between is "no change"), and
+  // feed the result to the Segmenter so handheld micro-shake doesn't
+  // open Active Segments. Skipped entirely in Continuous Mode (no
+  // detector) and on devices without an IMU (Simulator).
+  const [deviceUnstable, setDeviceUnstable] = useState(false);
+  useEffect(() => {
+    if (sessionModeRef.current === 'continuous') return;
+    let cancelled = false;
+    let started = false;
+    let unstableState = false;
+    const STABLE_THRESHOLD = 0.025; // below this → stable
+    const UNSTABLE_THRESHOLD = 0.055; // above this → unstable
+    const tick = async () => {
+      try {
+        const mag = await getDeviceMotionMagnitude();
+        if (cancelled) return;
+        // Hysteresis: only flip state when the magnitude crosses the
+        // far side of the band. This avoids flickering between the
+        // two states from small reading-to-reading noise.
+        const next = unstableState
+          ? mag > STABLE_THRESHOLD
+          : mag > UNSTABLE_THRESHOLD;
+        if (next !== unstableState) {
+          unstableState = next;
+          setDeviceUnstable(next);
+          segmenterRef.current?.setDeviceUnstable(next);
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    (async () => {
+      try {
+        started = await startMotionUpdates();
+        if (cancelled) {
+          if (started) await stopMotionUpdates();
+          return;
+        }
+      } catch {
+        started = false;
+      }
+      if (!started) return; // Simulator or unsupported device — skip the loop
+    })();
+    const t = setInterval(tick, 200);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+      stopMotionUpdates().catch(() => {});
+    };
+  }, []);
+
   return (
     <View style={styles.root}>
       {device ? (
         <Camera
           style={StyleSheet.absoluteFill}
           device={device}
-          outputs={[videoOutput, frameOutput]}
+          outputs={
+            isPlayersMode
+              ? [videoOutput, frameOutput, personFrameOutput, photoOutput]
+              : [videoOutput, frameOutput, photoOutput]
+          }
           isActive
+          zoom={setupZoom}
           onPreviewStarted={() => {
             console.log('[RecordingScreen] preview started');
             setPreviewStarted(true);
@@ -432,12 +657,37 @@ export function RecordingScreen() {
           fixedThreshold={useFixedThreshold}
         />
         <MotionBars motion={motionScore} />
+        {__DEV__ && (
+          <DiagnosticsHud
+            motionScore={motionScore}
+            mode={sessionModeRef.current}
+            isPlayersMode={isPlayersMode}
+            lastPersonCount={lastPersonCount}
+          />
+        )}
       </View>
-      {(thermalState === 'serious' || thermalState === 'critical') && (
+      {thermalState === 'critical' && (
         <View style={styles.thermalBanner} pointerEvents="none">
           <Text style={styles.thermalBannerText}>
-            iPhone is running hot ({thermalState}). Plug in or move to a
-            cooler spot — recording continues.
+            iPhone is running hot (critical). The OS may downgrade
+            camera quality soon — plug in or move to a cooler spot.
+            Recording continues.
+          </Text>
+        </View>
+      )}
+      {thermalState === 'serious' && (
+        <View style={styles.thermalPill} pointerEvents="none">
+          <Text style={styles.thermalPillText}>system: warm</Text>
+        </View>
+      )}
+      {/* Handheld guardrail banner. Only meaningful while a detector
+          is active — Continuous Mode skips the IMU polling so this
+          stays hidden, but defensively we also gate on the mode. */}
+      {deviceUnstable && sessionModeRef.current !== 'continuous' && (
+        <View style={styles.unstableBanner} pointerEvents="none">
+          <Text style={styles.unstableBannerText}>
+            Phone is moving — put it on a stand. Auto Record is
+            paused until the camera holds still.
           </Text>
         </View>
       )}
@@ -457,7 +707,51 @@ export function RecordingScreen() {
       ) : (
         <StopFab onPress={onStop} />
       )}
+      {/* In-app Snapshot button — bottom-left mirror of the Stop FAB.
+          Shown only while recording (Watching / Capturing); hidden in
+          Calibrating to keep that screen focused, and during Stopping
+          since the photoOutput is about to be torn down. */}
+      {(sessionState === 'Watching' || sessionState === 'Capturing') && (
+        <SnapshotFab onPress={onSnapshot} flash={snapshotFlash} />
+      )}
     </View>
+  );
+}
+
+function SnapshotFab({
+  onPress,
+  flash,
+}: {
+  onPress: () => void;
+  flash: 'idle' | 'saving' | 'saved' | 'error';
+}) {
+  const disabled = flash === 'saving';
+  const bg =
+    flash === 'saved'
+      ? colors.stateSoft.done
+      : flash === 'error'
+        ? colors.stateSoft.capturing
+        : colors.surface;
+  const label =
+    flash === 'saved'
+      ? '✓ SAVED'
+      : flash === 'error'
+        ? '× FAILED'
+        : flash === 'saving'
+          ? '…'
+          : '📷';
+  return (
+    <Pressable
+      onPress={disabled ? undefined : onPress}
+      style={[
+        styles.snapshotFab,
+        { backgroundColor: bg },
+        disabled && styles.snapshotFabDisabled,
+      ]}
+      accessibilityRole="button"
+      accessibilityLabel="Capture a still frame and save to Photos">
+      <Text style={styles.snapshotFabLabel}>{label}</Text>
+    </Pressable>
   );
 }
 
@@ -551,6 +845,18 @@ async function onMasterFinished(
   usedFixedThreshold: boolean,
   finishWithSuccess: (info: DoneInfo) => void,
   finishWithError: (message: string) => void,
+  // When set, the Master arrived via the recorder-error recovery path
+  // rather than a clean stopRecording. The note is surfaced on Done so
+  // the user knows what happened *and* that the Master was preserved.
+  // The splice + Photos save still runs — partial Masters are still
+  // useful and AVFoundation often reports
+  // `AVErrorRecordingSuccessfullyFinishedKey=true` alongside the error.
+  recoveryReason: string | null = null,
+  // True when the Session ran in Continuous Mode. The Master is the
+  // user-facing artifact — save it directly to Photos (production
+  // builds included), skip the splice entirely, and surface the Done
+  // screen as a clean success rather than a recovery.
+  continuousMode: boolean = false,
 ) {
   const masterDurationS =
     recordingStartedAt != null ? (Date.now() - recordingStartedAt) / 1000 : 0;
@@ -558,12 +864,105 @@ async function onMasterFinished(
     masterUri,
     masterDurationS,
     segmentCount: segments.length,
+    recovery: recoveryReason,
+    continuous: continuousMode,
   });
 
-  if (segments.length === 0) {
+  // If we have *no* file on disk there's nothing to recover — surface a
+  // hard error and bail. Otherwise every downstream branch attempts to
+  // preserve the Master via Photos (dev) and mark the DB row 'done' so
+  // the in-app Library can surface it.
+  const masterExists = await fileExists(masterUri).catch(() => false);
+  if (!masterExists) {
     finishWithError(
-      `No motion was detected inside the Court ROI during this Session, so there's nothing to splice. (Master kept at ${masterUri}. Try lowering START_THRESHOLD in src/detection/config.ts, or check that the ROI covers actual play.)`,
+      recoveryReason
+        ? `${recoveryReason} (Master file missing at ${masterUri}; nothing to recover.)`
+        : `Master file missing at ${masterUri}.`,
     );
+    return;
+  }
+
+  // Save the Master to Photos *first*, before any splice attempt, so a
+  // splice failure or thermal interruption can't strand the recording.
+  // In production builds Photos normally only gets the Session
+  // Recording per ADR-0007; in __DEV__ we mirror the Master too for
+  // visual diffing. In Continuous Mode the Master *is* the user-facing
+  // artifact (no splice runs), so we save it in production too.
+  const perm = await iosRequestAddOnlyGalleryPermission();
+  const photosPermOk = perm === 'granted' || perm === 'limited';
+  const photosPermDenied = photosPermOk
+    ? null
+    : `(photos permission: ${perm} — enable in Settings → Active Sportz → Photos)`;
+  const shouldMirrorMasterToPhotos = __DEV__ || continuousMode;
+  let masterPhotosId: string | null = null;
+  if (shouldMirrorMasterToPhotos && photosPermOk) {
+    try {
+      masterPhotosId = await saveToPhotos(masterUri);
+    } catch (e: any) {
+      console.warn('[RecordingScreen] saveToPhotos(master) failed', e?.message ?? e);
+      masterPhotosId = `(save failed: ${e?.message ?? e})`;
+    }
+  } else if (shouldMirrorMasterToPhotos) {
+    masterPhotosId = photosPermDenied;
+  }
+
+  // Continuous Mode: the Master is the Session. No splice, no Active
+  // Segments. Mark the DB row done with `session_uri = master_uri` so
+  // the Library renders it as a complete entry (not a "(missing)"
+  // recovery), and land on a clean Done screen.
+  if (continuousMode) {
+    if (sessionId != null) {
+      try {
+        markDone({
+          sessionId,
+          sessionUri: masterUri,
+          endedAtMs: Date.now(),
+        });
+      } catch (e: any) {
+        console.warn('[RecordingScreen] markDone(continuous) failed', e?.message ?? e);
+      }
+    }
+    finishWithSuccess({
+      masterUri,
+      masterDurationS,
+      sessionUri: masterUri,
+      spliceMs: 0,
+      outputDurationMs: masterDurationS * 1000,
+      sessionPhotosId: masterPhotosId,
+      masterPhotosId,
+      segments,
+      usedFixedThreshold,
+      recoveryNote: null,
+    });
+    return;
+  }
+
+  // No segments → no splice possible. Land on the Done screen with the
+  // Master preserved (sessionUri stays null; the Library renders these
+  // as "Master only" entries). Mark the DB row 'done' via the recovery
+  // marker so listDone() finds it.
+  if (segments.length === 0) {
+    if (sessionId != null) {
+      try {
+        markDoneRecovered({ sessionId, endedAtMs: Date.now() });
+      } catch (e: any) {
+        console.warn('[RecordingScreen] markDoneRecovered failed', e?.message ?? e);
+      }
+    }
+    finishWithSuccess({
+      masterUri,
+      masterDurationS,
+      sessionUri: null,
+      spliceMs: 0,
+      outputDurationMs: 0,
+      sessionPhotosId: null,
+      masterPhotosId,
+      segments,
+      usedFixedThreshold,
+      recoveryNote:
+        recoveryReason ??
+        'No motion was detected inside the Court ROI, so no Session Recording was produced. Your Master Recording is preserved.',
+    });
     return;
   }
 
@@ -575,24 +974,15 @@ async function onMasterFinished(
   try {
     const result = await splice(masterUri, spliceSegments);
     console.log('[RecordingScreen] splice ok', result);
-    // iOS Add-Only photo-library permission must be requested explicitly;
-    // without the prompt, saveAsset rejects with an opaque "Unknown error".
-    const perm = await iosRequestAddOnlyGalleryPermission();
     let sessionPhotosId: string | null = null;
-    let masterPhotosId: string | null = null;
-    if (perm !== 'granted' && perm !== 'limited') {
-      const denied = `(photos permission: ${perm} — enable in Settings → Active Sportz → Photos)`;
-      sessionPhotosId = denied;
-      masterPhotosId = denied;
+    if (!photosPermOk) {
+      sessionPhotosId = photosPermDenied;
     } else {
-      sessionPhotosId = await saveToPhotos(result.outputUri);
-      // Dev-only convenience: mirror the Master into Photos so we can
-      // eyeball Master vs Session side-by-side while iterating on
-      // detection (M3–M4). Production (ADR-0007) keeps the Master in
-      // the app sandbox; M5 will add the in-app "My Sessions" library
-      // with user-controlled retention and this branch goes away.
-      if (__DEV__) {
-        masterPhotosId = await saveToPhotos(masterUri);
+      try {
+        sessionPhotosId = await saveToPhotos(result.outputUri);
+      } catch (e: any) {
+        console.warn('[RecordingScreen] saveToPhotos(session) failed', e?.message ?? e);
+        sessionPhotosId = `(save failed: ${e?.message ?? e})`;
       }
     }
     if (sessionId != null) {
@@ -616,11 +1006,36 @@ async function onMasterFinished(
       masterPhotosId,
       segments,
       usedFixedThreshold,
+      recoveryNote: recoveryReason,
     });
   } catch (e: any) {
-    const message = `splice: ${e?.message ?? e}`;
-    console.warn('[RecordingScreen] splice failed', message);
-    finishWithError(message);
+    // Splice failed but the Master is on disk and already saved to
+    // Photos (in __DEV__). Land on Done with the Master preserved
+    // and the splice error surfaced as the recovery note so the user
+    // sees what happened.
+    const spliceErr = `splice: ${e?.message ?? e}`;
+    console.warn('[RecordingScreen] splice failed', spliceErr);
+    if (sessionId != null) {
+      try {
+        markDoneRecovered({ sessionId, endedAtMs: Date.now() });
+      } catch (innerE: any) {
+        console.warn('[RecordingScreen] markDoneRecovered failed', innerE?.message ?? innerE);
+      }
+    }
+    finishWithSuccess({
+      masterUri,
+      masterDurationS,
+      sessionUri: null,
+      spliceMs: 0,
+      outputDurationMs: 0,
+      sessionPhotosId: null,
+      masterPhotosId,
+      segments,
+      usedFixedThreshold,
+      recoveryNote: recoveryReason
+        ? `${recoveryReason} Splice also failed: ${spliceErr}`
+        : `Splice failed (${spliceErr}). Your Master Recording is preserved.`,
+    });
   }
 }
 
@@ -657,6 +1072,59 @@ function StateChip({
       <View style={styles.chipDot} />
       <Text style={styles.chipText}>{state}</Text>
       {fixedThreshold && <Text style={styles.chipBadge}>fixed</Text>}
+    </View>
+  );
+}
+
+/**
+ * Dev-only diagnostics HUD shown next to the motion bars. Surfaces:
+ *   - Live motion score against the START / END thresholds.
+ *   - Active Detection Mode (Smart / Enhanced).
+ *   - Latest person count when Enhanced Mode is on (`–` if the
+ *     person-detector worklet is still on the no-op shim awaiting
+ *     the bake-off model).
+ *
+ * Visible in `__DEV__` builds only. Renders as a small monospaced
+ * card so the visual weight stays low — the motion-bar column above
+ * remains the primary "we see motion" signal for parents.
+ */
+function DiagnosticsHud({
+  motionScore,
+  mode,
+  isPlayersMode,
+  lastPersonCount,
+}: {
+  motionScore: number;
+  mode: 'motion' | 'players' | 'continuous';
+  isPlayersMode: boolean;
+  lastPersonCount: number | null;
+}) {
+  const aboveStart = motionScore >= START_THRESHOLD;
+  const aboveEnd = motionScore >= END_THRESHOLD;
+  const scoreColor = aboveStart
+    ? colors.actionStop // warm — score is high enough to OPEN
+    : aboveEnd
+      ? colors.stateSoft.calibrating // amber — between thresholds
+      : colors.textSubtle;
+  return (
+    <View style={styles.hud} pointerEvents="none">
+      <Text style={[styles.hudKey, { color: colors.textSubtle }]}>score</Text>
+      <Text style={[styles.hudVal, { color: scoreColor }]}>
+        {motionScore.toFixed(3)}
+      </Text>
+      <Text style={styles.hudThresh}>
+        ↑{START_THRESHOLD.toFixed(2)} ↓{END_THRESHOLD.toFixed(2)}
+      </Text>
+      <Text style={styles.hudKey}>mode</Text>
+      <Text style={styles.hudVal}>{labelForMode(mode)}</Text>
+      {isPlayersMode && (
+        <>
+          <Text style={styles.hudKey}>players</Text>
+          <Text style={styles.hudVal}>
+            {lastPersonCount == null ? '–' : `${lastPersonCount}`}
+          </Text>
+        </>
+      )}
     </View>
   );
 }
@@ -833,6 +1301,31 @@ const styles = StyleSheet.create({
     letterSpacing: 1.2,
     ...overlayShadow,
   },
+  snapshotFab: {
+    position: 'absolute',
+    left: spacing.xl,
+    bottom: 128,
+    minWidth: 64,
+    height: 56,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.pill,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: colors.text,
+    shadowColor: colors.shadow,
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  snapshotFabDisabled: { opacity: 0.6 },
+  snapshotFabLabel: {
+    color: colors.text,
+    fontSize: 14,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
   stoppingPanel: {
     position: 'absolute',
     left: spacing.base,
@@ -874,7 +1367,13 @@ const styles = StyleSheet.create({
   },
   thermalBanner: {
     position: 'absolute',
-    top: 116,
+    // Anchored to the bottom band (above the Stop / Snapshot FABs at
+    // bottom: 128) so the entire top region remains available for the
+    // detection UI — state chip, motion bars, lockHint, and (in dev)
+    // the diagnostics HUD. The 'critical' state is rare, but when it
+    // does show the user is mid-Session and the motion-feedback
+    // affordances are the most important things to keep unobscured.
+    bottom: 200,
     left: spacing.base,
     right: spacing.base,
     padding: spacing.md,
@@ -888,6 +1387,79 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 12,
     textAlign: 'center',
+  },
+  // Quieter inline indicator for the iOS `'serious'` thermal state. iOS
+  // reports `'serious'` aggressively when a debugger is attached or
+  // screen mirroring is on, so we don't want it to be alarming. A small
+  // pill near the state row tells advanced users / developers without
+  // shouting at parents during a real match.
+  thermalPill: {
+    position: 'absolute',
+    top: 64,
+    left: spacing.base + 90, // sit to the right of the state pill
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 2,
+    borderRadius: radii.pill,
+    backgroundColor: colors.surfaceSubtle,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  thermalPillText: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 10,
+  },
+  // Handheld guardrail banner. Anchored above the FAB area so it
+  // doesn't compete with the motion bars / diagnostics HUD at top.
+  // Warm-toned (uses the Calibrating accent for "informational, not
+  // an error") so it's distinct from the red thermal banner.
+  unstableBanner: {
+    position: 'absolute',
+    bottom: 260,
+    left: spacing.base,
+    right: spacing.base,
+    padding: spacing.md,
+    borderRadius: radii.lg,
+    backgroundColor: colors.state.calibrating,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  unstableBannerText: {
+    ...typography.bodyEmphasis,
+    color: colors.text,
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  hud: {
+    marginTop: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 4,
+    borderRadius: radii.md,
+    backgroundColor: colors.surfaceSubtle,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'flex-end',
+    minWidth: 90,
+  },
+  hudKey: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 9,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginTop: 2,
+  },
+  hudVal: {
+    ...typography.mono,
+    color: colors.text,
+    fontSize: 12,
+    lineHeight: 14,
+  },
+  hudThresh: {
+    ...typography.mono,
+    color: colors.textSubtle,
+    fontSize: 9,
+    lineHeight: 11,
   },
   lockHint: {
     position: 'absolute',

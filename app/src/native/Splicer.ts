@@ -42,6 +42,14 @@ type SplicerNative = {
   getThermalState: () => Promise<ThermalState>;
   requestNotificationPermission: () => Promise<boolean>;
   scheduleLocalNotification: (title: string, body: string) => Promise<void>;
+  // Device-motion (CMMotionManager) — used by the handheld guardrail
+  // (T28 / ADR-0009 amendment, decisions-log). `startMotionUpdates`
+  // resolves false on devices without an IMU (the iPhone Simulator).
+  // `getDeviceMotionMagnitude` returns user-induced acceleration in
+  // g's (gravity removed), 0 when stopped.
+  startMotionUpdates: () => Promise<boolean>;
+  getDeviceMotionMagnitude: () => Promise<number>;
+  stopMotionUpdates: () => Promise<void>;
 };
 
 const native = NativeModules.Splicer as SplicerNative | undefined;
@@ -144,4 +152,29 @@ export function scheduleLocalNotification(
   body: string,
 ): Promise<void> {
   return requireNative().scheduleLocalNotification(title, body);
+}
+
+/**
+ * Start CMDeviceMotion updates. Resolves true if the IMU is available
+ * (real device) or false (Simulator). Idempotent — calling while
+ * already running just resolves true.
+ */
+export function startMotionUpdates(): Promise<boolean> {
+  return requireNative().startMotionUpdates();
+}
+
+/**
+ * Latest user-induced acceleration magnitude in g's (gravity removed).
+ * Stable phone on a stand: ~0.005–0.02. Handheld idle grip: ~0.02–0.05.
+ * Active handheld (walking, swaying): 0.05+. The handheld guardrail
+ * uses a hysteresis band around 0.03–0.05 g to decide whether motion
+ * scores should be allowed to open Active Segments.
+ */
+export function getDeviceMotionMagnitude(): Promise<number> {
+  return requireNative().getDeviceMotionMagnitude();
+}
+
+/** Stop CMDeviceMotion updates and zero the last-read magnitude. */
+export function stopMotionUpdates(): Promise<void> {
+  return requireNative().stopMotionUpdates();
 }

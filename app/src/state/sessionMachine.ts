@@ -19,7 +19,20 @@
 
 import { create } from 'zustand';
 
-export type Roi = { x: number; y: number; w: number; h: number };
+// A point in normalized 0..1 screen coordinates (top-left origin).
+export type RoiCorner = readonly [number, number];
+
+// Court ROI as a quadrilateral, per ADR-0010. Corners are normalized
+// 0..1 screen coords ordered top-left → top-right → bottom-right → bottom-left
+// (clockwise from the screen-top). The motion worklet treats "inside the
+// Court ROI" as "inside this polygon" via a point-in-quad mask in its
+// sampling loop; overlays render a four-segment polygon path.
+//
+// The quad is *assumed convex* (a real volleyball court always is from any
+// reasonable camera angle). Setup validates convexity before committing.
+export type Roi = {
+  corners: readonly [RoiCorner, RoiCorner, RoiCorner, RoiCorner];
+};
 
 export type SessionState =
   | 'Setup'
@@ -45,8 +58,15 @@ export type AppScreen =
 export type DoneInfo = {
   masterUri: string;
   masterDurationS: number;
-  sessionUri: string;
+  // Null when no Session Recording was produced — either no Active Segments
+  // were captured, or the splice failed, or the recorder errored mid-Session
+  // and we recovered just the Master. The Done screen renders a "Master
+  // preserved" state in those cases instead of the regular "Saved to Photos"
+  // success.
+  sessionUri: string | null;
   spliceMs: number;
+  // Length of the Session Recording in milliseconds. Zero when sessionUri
+  // is null (no splice ran).
   outputDurationMs: number;
   sessionPhotosId: string | null;
   // Only populated in __DEV__ builds (M2–M4 convenience for visually
@@ -59,6 +79,11 @@ export type DoneInfo = {
   // accuracy may be lower (ADR-0006). Set when the user taps Skip
   // Calibration during the Warm-up phase.
   usedFixedThreshold: boolean;
+  // Set when the Session was recovered rather than finished cleanly:
+  // recorder errored, splice failed, or no motion was detected. The
+  // string is rendered prominently on the Done screen so the user
+  // knows what happened *and* sees that the Master was preserved.
+  recoveryNote: string | null;
 };
 
 // An Active Segment as the detector emitted it. Carries diagnostics
@@ -80,6 +105,13 @@ interface SessionStore {
   sessionState: SessionState;
   setupStep: SetupStep;
   roi: Roi | null;
+  // Camera zoom factor chosen on Setup Step 1 via pinch-to-zoom
+  // (decisions-log: "Pinch-to-zoom at Setup"). Frozen at Auto Record
+  // and applied as the `zoom` prop on both the Setup preview and the
+  // RecordingScreen Camera so the worklet sees exactly what the user
+  // framed. Defaults to 1.0 (no zoom) and survives Step1↔Step2
+  // navigation. Not persisted across Sessions.
+  setupZoom: number;
   motionScore: number;
 
   masterUri: string | null;
@@ -115,6 +147,7 @@ interface SessionStore {
   setAppScreen: (screen: AppScreen) => void;
   setFocusedSessionId: (id: number | null) => void;
   setRoi: (roi: Roi | null) => void;
+  setSetupZoom: (zoom: number) => void;
   setSetupStep: (step: SetupStep) => void;
   setMotionScore: (m: number) => void;
 
@@ -143,6 +176,7 @@ const initial = {
   sessionState: 'Setup' as SessionState,
   setupStep: 1 as SetupStep,
   roi: null,
+  setupZoom: 1,
   motionScore: 0,
   masterUri: null,
   recordingStartedAt: null,
@@ -162,6 +196,7 @@ export const useSessionStore = create<SessionStore>(set => ({
   setAppScreen: appScreen => set({ appScreen }),
   setFocusedSessionId: focusedSessionId => set({ focusedSessionId }),
   setRoi: roi => set({ roi }),
+  setSetupZoom: setupZoom => set({ setupZoom }),
   setSetupStep: setupStep => set({ setupStep }),
   setMotionScore: m => set({ motionScore: Math.max(0, Math.min(1, m)) }),
 

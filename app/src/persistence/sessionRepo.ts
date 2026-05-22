@@ -6,9 +6,22 @@
  * a per-segment write stall.
  */
 
-import type { Roi } from '../state/sessionMachine';
+import type { Roi, RoiCorner } from '../state/sessionMachine';
 import type { DbSessionState } from './db';
 import { getDB } from './db';
+
+// Internal identifier for the per-Session Detection Mode (ADR-0009).
+// UI labels (`Smart` / `Enhanced` / `Continuous`) live behind
+// `labelForMode` in the screens layer — the DB and store always speak
+// in these identifiers.
+//   - 'motion'     — motion-only detection (UI: "Smart")
+//   - 'players'    — motion + on-device player detection (UI: "Enhanced")
+//   - 'continuous' — no detection; the Master Recording is saved
+//                    directly as the user-facing video, no Active
+//                    Segments, no splice. Useful for non-court captures
+//                    and for validating the recording path in isolation
+//                    (UI: "Continuous").
+export type DetectionMode = 'motion' | 'players' | 'continuous';
 
 export type SessionRow = {
   id: number;
@@ -18,10 +31,62 @@ export type SessionRow = {
   masterUri: string | null;
   sessionUri: string | null;
   roi: Roi;
+  setupZoom: number;
+  detectionMode: DetectionMode;
   usedFixedThreshold: boolean;
 };
 
+function parseCorners(json: unknown): Roi['corners'] {
+  // Defensive parse — a malformed row should not crash the Library list.
+  // If we can't deserialize, return a unit-square quad so the row remains
+  // visible but the ROI is obviously wrong.
+  if (typeof json !== 'string') {
+    return [
+      [0, 0],
+      [1, 0],
+      [1, 1],
+      [0, 1],
+    ] as const;
+  }
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (
+      Array.isArray(parsed) &&
+      parsed.length === 4 &&
+      parsed.every(
+        c =>
+          Array.isArray(c) &&
+          c.length === 2 &&
+          typeof c[0] === 'number' &&
+          typeof c[1] === 'number',
+      )
+    ) {
+      return [
+        parsed[0] as RoiCorner,
+        parsed[1] as RoiCorner,
+        parsed[2] as RoiCorner,
+        parsed[3] as RoiCorner,
+      ] as const;
+    }
+  } catch {
+    // fall through to the unit-square fallback
+  }
+  return [
+    [0, 0],
+    [1, 0],
+    [1, 1],
+    [0, 1],
+  ] as const;
+}
+
 function rowToSession(r: Record<string, unknown>): SessionRow {
+  const rawMode = String(r.detection_mode ?? 'motion');
+  const detectionMode: DetectionMode =
+    rawMode === 'players'
+      ? 'players'
+      : rawMode === 'continuous'
+        ? 'continuous'
+        : 'motion';
   return {
     id: Number(r.id),
     startedAtMs: Number(r.started_at_ms),
@@ -29,28 +94,29 @@ function rowToSession(r: Record<string, unknown>): SessionRow {
     state: String(r.state) as DbSessionState,
     masterUri: (r.master_uri as string | null) ?? null,
     sessionUri: (r.session_uri as string | null) ?? null,
-    roi: {
-      x: Number(r.roi_x),
-      y: Number(r.roi_y),
-      w: Number(r.roi_w),
-      h: Number(r.roi_h),
-    },
+    roi: { corners: parseCorners(r.roi_corners) },
+    setupZoom: Number(r.setup_zoom ?? 1),
+    detectionMode,
     usedFixedThreshold: Number(r.used_fixed_threshold) === 1,
   };
 }
 
-export function openSession(args: { startedAtMs: number; roi: Roi }): number {
+export function openSession(args: {
+  startedAtMs: number;
+  // Null when Mode is 'continuous' — no Court ROI is captured. The DB
+  // column is nullable; rowToSession() returns a unit-square fallback
+  // so consumers don't have to special-case the read path.
+  roi: Roi | null;
+  setupZoom: number;
+  detectionMode: DetectionMode;
+}): number {
+  const cornersJson =
+    args.roi == null ? null : JSON.stringify(args.roi.corners);
   const result = getDB().executeSync(
     `INSERT INTO sessions
-      (started_at_ms, state, roi_x, roi_y, roi_w, roi_h)
-     VALUES (?, 'recording', ?, ?, ?, ?);`,
-    [
-      args.startedAtMs,
-      args.roi.x,
-      args.roi.y,
-      args.roi.w,
-      args.roi.h,
-    ],
+      (started_at_ms, state, roi_corners, setup_zoom, detection_mode)
+     VALUES (?, 'recording', ?, ?, ?);`,
+    [args.startedAtMs, cornersJson, args.setupZoom, args.detectionMode],
   );
   if (result.insertId == null) {
     throw new Error('openSession: missing insertId');
@@ -89,6 +155,25 @@ export function markDone(args: {
        SET state = 'done', session_uri = ?, ended_at_ms = ?
        WHERE id = ?;`,
     [args.sessionUri, args.endedAtMs, args.sessionId],
+  );
+}
+
+/**
+ * Recovered-finish marker. Used when the recorder errored or the splice
+ * failed but the Master file is on disk — we move the row to 'done' so
+ * the in-app Library can surface it, but leave `session_uri` NULL so the
+ * Library knows there's no spliced output and can render a "Master
+ * preserved" entry instead of a normal Session Recording.
+ */
+export function markDoneRecovered(args: {
+  sessionId: number;
+  endedAtMs: number;
+}) {
+  getDB().executeSync(
+    `UPDATE sessions
+       SET state = 'done', ended_at_ms = ?
+       WHERE id = ?;`,
+    [args.endedAtMs, args.sessionId],
   );
 }
 

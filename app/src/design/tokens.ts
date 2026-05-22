@@ -34,7 +34,13 @@ export const colors = {
 
   // Camera overlay
   roiStroke: '#ffffff',
-  roiCapturingFill: 'rgba(232, 90, 59, 0.18)', // matches state.capturing
+  // Warm-tone stroke for the polygon overlay in Capturing state. We render
+  // edges as rotated thin Views (no SVG, ADR-0010); a filled-polygon
+  // "capturing" affordance isn't reachable without triangle decomposition,
+  // so a heavier warm stroke carries the same "this moment is being kept"
+  // signal that the original rect's translucent fill did.
+  roiCapturingStroke: '#e85a3b',
+  roiCapturingFill: 'rgba(232, 90, 59, 0.18)', // legacy — bbox fallback only
   dimMask: 'rgba(0, 0, 0, 0.6)', // outside-ROI dim in Setup B's Step 2
 
   // Action — Start (green "go")

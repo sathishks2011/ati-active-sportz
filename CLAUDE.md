@@ -6,8 +6,8 @@ Mobile app that auto-records youth volleyball, stripping dead time so parents ge
 
 Domain language and architectural decisions are pinned in docs — **do not re-derive them from memory or the code**:
 
-- `CONTEXT.md` — domain glossary (Session, Master Recording, Session Recording, Active Segment, Court ROI, Warm-up, Session State) and MVP scope / Phase-2 deferrals. **Authoritative for terminology.**
-- `docs/adr/0001..0008-*.md` — eight ADRs. Read `0007` and `0008` first for current architecture + tech stack. ADRs `0003` and `0005` are marked *superseded by 0007*.
+- `CONTEXT.md` — domain glossary (Session, Master Recording, Session Recording, Active Segment, Court ROI, Detection Mode, Warm-up, Session State) and MVP scope / Phase-2 deferrals. **Authoritative for terminology.**
+- `docs/adr/0001..0010-*.md` — ten ADRs. Read `0007` (continuous Master), `0008` (tech stack), `0009` (Detection Mode / player-presence gate), and `0010` (quadrilateral Court ROI) first for current architecture. ADRs `0003` and `0005` are marked *superseded by 0007*.
 - `docs/decisions-log.md` — sub-ADR-bar decisions with one-line rationale.
 - `idea.md` — original brainstorming, partly superseded. Context only, not authoritative.
 
